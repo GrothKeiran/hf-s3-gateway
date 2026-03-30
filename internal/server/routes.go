@@ -2,13 +2,11 @@ package server
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -59,15 +57,16 @@ type obj struct {
 
 func RegisterRoutes(r *gin.Engine) {
 	registerHealthRoutes(r)
+	store := NewStorageFromEnv()
 	r.Use(authMiddleware())
 	r.GET("/", handleListBuckets)
 	r.PUT("/:bucket", handleCreateBucket)
 	r.HEAD("/:bucket", handleHeadBucket)
-	r.GET("/:bucket", handleBucketOps)
-	r.PUT("/:bucket/*key", handlePutObject)
-	r.GET("/:bucket/*key", handleGetObject)
-	r.HEAD("/:bucket/*key", handleHeadObject)
-	r.DELETE("/:bucket/*key", handleDeleteObject)
+	r.GET("/:bucket", handleBucketOps(store))
+	r.PUT("/:bucket/*key", handlePutObject(store))
+	r.GET("/:bucket/*key", handleGetObject(store))
+	r.HEAD("/:bucket/*key", handleHeadObject(store))
+	r.DELETE("/:bucket/*key", handleDeleteObject(store))
 }
 
 func handleListBuckets(c *gin.Context) {
@@ -82,113 +81,114 @@ func handleListBuckets(c *gin.Context) {
 func handleCreateBucket(c *gin.Context) { c.Status(http.StatusNotImplemented) }
 func handleHeadBucket(c *gin.Context)   { c.Status(http.StatusOK) }
 
-func handleBucketOps(c *gin.Context) {
-	if c.Query("list-type") == "2" || c.Query("prefix") != "" || c.Query("delimiter") != "" {
-		handleListObjectsV2(c)
-		return
+func handleBucketOps(store Storage) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Query("list-type") == "2" || c.Query("prefix") != "" || c.Query("delimiter") != "" {
+			handleListObjectsV2(store)(c)
+			return
+		}
+		c.Status(http.StatusOK)
 	}
-	c.Status(http.StatusOK)
 }
 
-func handleListObjectsV2(c *gin.Context) {
-	root := dataRoot()
-	prefix := strings.TrimPrefix(c.Query("prefix"), "/")
-	items := make([]obj, 0)
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
+func handleListObjectsV2(store Storage) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		prefix := cleanKey(c.Query("prefix"))
+		items, err := store.ListObjects(c.Request.Context(), prefix)
 		if err != nil {
-			return nil
+			handleStorageErr(c, err)
+			return
 		}
-		key := filepath.ToSlash(rel)
-		if prefix != "" && !strings.HasPrefix(key, prefix) {
-			return nil
+		out := make([]obj, 0, len(items))
+		for _, item := range items {
+			out = append(out, obj{
+				Key:          item.Key,
+				LastModified: item.ModTime.UTC().Format(time.RFC3339),
+				ETag:         item.ETag,
+				Size:         item.Size,
+				StorageClass: valueOr(item.StorageClass, "STANDARD"),
+			})
 		}
-		items = append(items, obj{
-			Key:          key,
-			LastModified: info.ModTime().UTC().Format(time.RFC3339),
-			ETag:         fmt.Sprintf("\"%x-%d\"", info.ModTime().UnixNano(), info.Size()),
-			Size:         info.Size(),
-			StorageClass: "STANDARD",
+		writeXML(c, http.StatusOK, listBucketResult{
+			Xmlns:       "http://s3.amazonaws.com/doc/2006-03-01/",
+			Name:        c.Param("bucket"),
+			Prefix:      prefix,
+			MaxKeys:     1000,
+			IsTruncated: false,
+			Contents:    out,
+			KeyCount:    len(out),
 		})
-		return nil
-	})
-	sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
-	writeXML(c, http.StatusOK, listBucketResult{
-		Xmlns:       "http://s3.amazonaws.com/doc/2006-03-01/",
-		Name:        c.Param("bucket"),
-		Prefix:      prefix,
-		MaxKeys:     1000,
-		IsTruncated: false,
-		Contents:    items,
-		KeyCount:    len(items),
-	})
+	}
 }
 
-func handlePutObject(c *gin.Context) {
-	key := cleanKey(c.Param("key"))
-	if key == "" {
-		c.Status(http.StatusBadRequest)
-		return
+func handlePutObject(store Storage) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := cleanKey(c.Param("key"))
+		if key == "" {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+		if err := store.PutObject(c.Request.Context(), key, c.Request.Body); err != nil {
+			handleStorageErr(c, err)
+			return
+		}
+		c.Status(http.StatusOK)
 	}
-	path := filepath.Join(dataRoot(), filepath.FromSlash(key))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		c.String(http.StatusInternalServerError, err.Error())
-		return
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		c.String(http.StatusInternalServerError, err.Error())
-		return
-	}
-	defer f.Close()
-	if _, err := io.Copy(f, c.Request.Body); err != nil {
-		c.String(http.StatusInternalServerError, err.Error())
-		return
-	}
-	c.Status(http.StatusOK)
 }
 
-func handleGetObject(c *gin.Context) {
-	path := filepath.Join(dataRoot(), filepath.FromSlash(cleanKey(c.Param("key"))))
-	if _, err := os.Stat(path); err != nil {
-		c.Status(http.StatusNotFound)
-		return
+func handleGetObject(store Storage) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		body, meta, err := store.GetObject(c.Request.Context(), cleanKey(c.Param("key")))
+		if err != nil {
+			handleStorageErr(c, err)
+			return
+		}
+		defer body.Close()
+		c.Header("Content-Length", fmt.Sprintf("%d", meta.Size))
+		if !meta.ModTime.IsZero() {
+			c.Header("Last-Modified", meta.ModTime.UTC().Format(http.TimeFormat))
+		}
+		if meta.ETag != "" {
+			c.Header("ETag", meta.ETag)
+		}
+		c.Status(http.StatusOK)
+		_, _ = io.Copy(c.Writer, body)
 	}
-	c.File(path)
 }
 
-func handleHeadObject(c *gin.Context) {
-	path := filepath.Join(dataRoot(), filepath.FromSlash(cleanKey(c.Param("key"))))
-	st, err := os.Stat(path)
-	if err != nil {
-		c.Status(http.StatusNotFound)
-		return
+func handleHeadObject(store Storage) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		meta, err := store.HeadObject(c.Request.Context(), cleanKey(c.Param("key")))
+		if err != nil {
+			handleStorageErr(c, err)
+			return
+		}
+		c.Header("Content-Length", fmt.Sprintf("%d", meta.Size))
+		if !meta.ModTime.IsZero() {
+			c.Header("Last-Modified", meta.ModTime.UTC().Format(http.TimeFormat))
+		}
+		if meta.ETag != "" {
+			c.Header("ETag", meta.ETag)
+		}
+		c.Status(http.StatusOK)
 	}
-	c.Header("Content-Length", fmt.Sprintf("%d", st.Size()))
-	c.Header("Last-Modified", st.ModTime().UTC().Format(http.TimeFormat))
-	c.Status(http.StatusOK)
 }
 
-func handleDeleteObject(c *gin.Context) {
-	path := filepath.Join(dataRoot(), filepath.FromSlash(cleanKey(c.Param("key"))))
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		c.String(http.StatusInternalServerError, err.Error())
-		return
+func handleDeleteObject(store Storage) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := store.DeleteObject(c.Request.Context(), cleanKey(c.Param("key"))); err != nil {
+			handleStorageErr(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
 	}
-	c.Status(http.StatusNoContent)
-}
-
-func dataRoot() string {
-	root := getenv("DATA_DIR", ".data")
-	_ = os.MkdirAll(root, 0o755)
-	return root
 }
 
 func cleanKey(key string) string {
-	return strings.TrimPrefix(key, "/")
+	for len(key) > 0 && key[0] == '/' {
+		key = key[1:]
+	}
+	return key
 }
 
 func writeXML(c *gin.Context, code int, v any) {
@@ -204,4 +204,22 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func handleStorageErr(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, errNotFound):
+		c.Status(http.StatusNotFound)
+	case isHFNotImplemented(err):
+		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
+}
+
+func valueOr(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }

@@ -21,7 +21,11 @@ Current first-pass behavior:
 ## Important
 
 This first scaffold currently uses local disk as the backing store while the S3 compatibility surface is being stabilized.
-The next step is swapping the storage backend to Hugging Face Buckets via official APIs/CLI.
+A storage abstraction layer is now in place, so the next step is swapping the backend to Hugging Face Buckets via official APIs/CLI without rewriting the HTTP layer.
+
+Current backend modes:
+- `STORAGE_BACKEND=local` → working
+- `STORAGE_BACKEND=hf` → placeholder, not implemented yet
 
 ## Run
 
