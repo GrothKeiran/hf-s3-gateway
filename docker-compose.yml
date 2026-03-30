@@ -1,0 +1,15 @@
+services:
+  hf-s3-gateway:
+    image: ghcr.io/grothkeiran/hf-s3-gateway:latest
+    ports:
+      - "9000:9000"
+    environment:
+      APP_ADDR: ":9000"
+      S3_ACCESS_KEY: "openlist"
+      S3_SECRET_KEY: "change-me"
+      HF_NAMESPACE: "your-hf-namespace"
+      HF_BUCKET: "your-bucket"
+      HF_TOKEN: "hf_xxx"
+      DATA_DIR: "/data"
+    volumes:
+      - ./data:/data
