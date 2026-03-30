@@ -25,7 +25,14 @@ A storage abstraction layer is now in place, so the next step is swapping the ba
 
 Current backend modes:
 - `STORAGE_BACKEND=local` → working
-- `STORAGE_BACKEND=hf` → placeholder, not implemented yet
+- `STORAGE_BACKEND=hf` → CLI-backed prototype
+
+HF backend notes:
+- prefers the official `hf` CLI
+- currently wired for `cp`/`rm` style operations
+- `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` are scaffolded through the CLI adapter
+- `ListObjects` still needs implementation against real `hf buckets` output behavior
+- if the `hf` binary is missing, the service returns a clear backend error instead of failing silently
 
 ## Run
 
