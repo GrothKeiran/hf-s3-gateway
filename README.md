@@ -15,6 +15,8 @@ Current first-pass behavior:
 - `GetObject`
 - `HeadObject`
 - `DeleteObject`
+- `Basic Auth` guard for OpenList-style access
+- `/healthz` health endpoint
 
 ## Important
 
@@ -25,6 +27,12 @@ The next step is swapping the storage backend to Hugging Face Buckets via offici
 
 ```bash
 docker compose up -d
+```
+
+Then check:
+
+```bash
+curl http://127.0.0.1:9000/healthz
 ```
 
 ## OpenList example

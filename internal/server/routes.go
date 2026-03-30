@@ -58,6 +58,8 @@ type obj struct {
 }
 
 func RegisterRoutes(r *gin.Engine) {
+	registerHealthRoutes(r)
+	r.Use(authMiddleware())
 	r.GET("/", handleListBuckets)
 	r.PUT("/:bucket", handleCreateBucket)
 	r.HEAD("/:bucket", handleHeadBucket)

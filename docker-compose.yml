@@ -5,6 +5,7 @@ services:
       - "9000:9000"
     environment:
       APP_ADDR: ":9000"
+      STORAGE_BACKEND: "local"
       S3_ACCESS_KEY: "openlist"
       S3_SECRET_KEY: "change-me"
       HF_NAMESPACE: "your-hf-namespace"
