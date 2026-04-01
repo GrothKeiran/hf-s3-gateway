@@ -1,12 +1,16 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -34,16 +38,22 @@ type bucket struct {
 }
 
 type listBucketResult struct {
-	XMLName               xml.Name `xml:"ListBucketResult"`
-	Xmlns                 string   `xml:"xmlns,attr,omitempty"`
-	Name                  string   `xml:"Name"`
-	Prefix                string   `xml:"Prefix"`
-	MaxKeys               int      `xml:"MaxKeys"`
-	IsTruncated           bool     `xml:"IsTruncated"`
-	Contents              []obj    `xml:"Contents"`
-	KeyCount              int      `xml:"KeyCount,omitempty"`
-	ContinuationToken     string   `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string   `xml:"NextContinuationToken,omitempty"`
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	Xmlns                 string         `xml:"xmlns,attr,omitempty"`
+	Name                  string         `xml:"Name"`
+	Prefix                string         `xml:"Prefix"`
+	Delimiter             string         `xml:"Delimiter,omitempty"`
+	MaxKeys               int            `xml:"MaxKeys"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	Contents              []obj          `xml:"Contents"`
+	CommonPrefixes        []commonPrefix `xml:"CommonPrefixes,omitempty"`
+	KeyCount              int            `xml:"KeyCount,omitempty"`
+	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
+}
+
+type commonPrefix struct {
+	Prefix string `xml:"Prefix"`
 }
 
 type obj struct {
@@ -53,6 +63,14 @@ type obj struct {
 	Size         int64  `xml:"Size"`
 	StorageClass string `xml:"StorageClass"`
 	Owner        *owner `xml:"Owner,omitempty"`
+}
+
+type s3Error struct {
+	XMLName   xml.Name `xml:"Error"`
+	Code      string   `xml:"Code"`
+	Message   string   `xml:"Message"`
+	Resource  string   `xml:"Resource,omitempty"`
+	RequestID string   `xml:"RequestId,omitempty"`
 }
 
 func RegisterRoutes(r *gin.Engine) {
@@ -94,29 +112,84 @@ func handleBucketOps(store Storage) gin.HandlerFunc {
 func handleListObjectsV2(store Storage) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		prefix := cleanKey(c.Query("prefix"))
+		delimiter := c.Query("delimiter")
+		maxKeys := parseMaxKeys(c.Query("max-keys"), 1000)
+		continuationToken := c.Query("continuation-token")
+
 		items, err := store.ListObjects(c.Request.Context(), prefix)
 		if err != nil {
 			handleStorageErr(c, err)
 			return
 		}
-		out := make([]obj, 0, len(items))
-		for _, item := range items {
-			out = append(out, obj{
+
+		startAfter := decodeContinuationToken(continuationToken)
+		filtered := items
+		if startAfter != "" {
+			filtered = make([]ObjectInfo, 0, len(items))
+			for _, item := range items {
+				if item.Key > startAfter {
+					filtered = append(filtered, item)
+				}
+			}
+		}
+
+		contents := make([]obj, 0)
+		commonSet := map[string]struct{}{}
+		count := 0
+		isTruncated := false
+		nextToken := ""
+
+		for _, item := range filtered {
+			rest := strings.TrimPrefix(item.Key, prefix)
+			if delimiter != "" {
+				if idx := strings.Index(rest, delimiter); idx >= 0 {
+					cp := prefix + rest[:idx+len(delimiter)]
+					if _, ok := commonSet[cp]; !ok {
+						if count >= maxKeys {
+							isTruncated = true
+							nextToken = encodeContinuationToken(item.Key)
+							break
+						}
+						commonSet[cp] = struct{}{}
+						count++
+					}
+					continue
+				}
+			}
+
+			if count >= maxKeys {
+				isTruncated = true
+				nextToken = encodeContinuationToken(item.Key)
+				break
+			}
+			contents = append(contents, obj{
 				Key:          item.Key,
-				LastModified: item.ModTime.UTC().Format(time.RFC3339),
+				LastModified: formatS3Time(item.ModTime),
 				ETag:         item.ETag,
 				Size:         item.Size,
 				StorageClass: valueOr(item.StorageClass, "STANDARD"),
 			})
+			count++
 		}
+
+		commonPrefixes := make([]commonPrefix, 0, len(commonSet))
+		for cp := range commonSet {
+			commonPrefixes = append(commonPrefixes, commonPrefix{Prefix: cp})
+		}
+		sort.Slice(commonPrefixes, func(i, j int) bool { return commonPrefixes[i].Prefix < commonPrefixes[j].Prefix })
+
 		writeXML(c, http.StatusOK, listBucketResult{
-			Xmlns:       "http://s3.amazonaws.com/doc/2006-03-01/",
-			Name:        c.Param("bucket"),
-			Prefix:      prefix,
-			MaxKeys:     1000,
-			IsTruncated: false,
-			Contents:    out,
-			KeyCount:    len(out),
+			Xmlns:                 "http://s3.amazonaws.com/doc/2006-03-01/",
+			Name:                  c.Param("bucket"),
+			Prefix:                prefix,
+			Delimiter:             delimiter,
+			MaxKeys:               maxKeys,
+			IsTruncated:           isTruncated,
+			Contents:              contents,
+			CommonPrefixes:        commonPrefixes,
+			KeyCount:              len(contents) + len(commonPrefixes),
+			ContinuationToken:     continuationToken,
+			NextContinuationToken: nextToken,
 		})
 	}
 }
@@ -199,6 +272,15 @@ func writeXML(c *gin.Context, code int, v any) {
 	_, _ = c.Writer.Write(out)
 }
 
+func writeS3Error(c *gin.Context, status int, code, message string) {
+	writeXML(c, status, s3Error{
+		Code:      code,
+		Message:   message,
+		Resource:  c.Request.URL.Path,
+		RequestID: "hf-s3-gateway",
+	})
+}
+
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -209,12 +291,51 @@ func getenv(key, fallback string) string {
 func handleStorageErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, errNotFound):
-		c.Status(http.StatusNotFound)
+		writeS3Error(c, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
 	case isHFNotImplemented(err):
-		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error()})
+		writeS3Error(c, http.StatusNotImplemented, "NotImplemented", err.Error())
 	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeS3Error(c, http.StatusInternalServerError, "InternalError", err.Error())
 	}
+}
+
+func parseMaxKeys(raw string, fallback int) int {
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	if n > 1000 {
+		return 1000
+	}
+	return n
+}
+
+func encodeContinuationToken(key string) string {
+	if key == "" {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString([]byte(key))
+}
+
+func decodeContinuationToken(tok string) string {
+	if tok == "" {
+		return ""
+	}
+	b, err := base64.StdEncoding.DecodeString(tok)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func formatS3Time(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 func valueOr(v, fallback string) string {

@@ -15,7 +15,8 @@ Current first-pass behavior:
 - `GetObject`
 - `HeadObject`
 - `DeleteObject`
-- `Basic Auth` guard for OpenList-style access
+- `Basic Auth` support
+- initial `AWS Signature V4` header-based request validation scaffold
 - `/healthz` health endpoint
 
 ## Important
@@ -31,8 +32,9 @@ HF backend notes:
 - prefers the official `hf` CLI
 - currently wired for `cp`/`rm` style operations
 - `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` are scaffolded through the CLI adapter
-- `ListObjects` still needs implementation against real `hf buckets` output behavior
+- `ListObjects` is now implemented with tolerant parsing for multiple possible `hf buckets ls/list` output shapes (JSON-first, text fallback)
 - if the `hf` binary is missing, the service returns a clear backend error instead of failing silently
+- real-world validation against the actual installed `hf` CLI is still recommended before production use
 
 ## Run
 

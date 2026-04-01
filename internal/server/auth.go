@@ -1,10 +1,16 @@
 package server
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -16,13 +22,30 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		if validBasicAuth(c.GetHeader("Authorization")) {
+		authz := c.GetHeader("Authorization")
+		switch {
+		case strings.HasPrefix(authz, "Basic "):
+			if validBasicAuth(authz) {
+				c.Next()
+				return
+			}
+			c.Header("WWW-Authenticate", `Basic realm="hf-s3-gateway"`)
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		case strings.HasPrefix(authz, "AWS4-HMAC-SHA256 "):
+			if err := validateSigV4(c.Request); err != nil {
+				writeS3Error(c, http.StatusForbidden, "SignatureDoesNotMatch", err.Error())
+				c.Abort()
+				return
+			}
 			c.Next()
 			return
+		default:
+			c.Header("WWW-Authenticate", `Basic realm="hf-s3-gateway"`)
+			writeS3Error(c, http.StatusUnauthorized, "AccessDenied", "Missing or unsupported authorization method.")
+			c.Abort()
+			return
 		}
-
-		c.Header("WWW-Authenticate", `Basic realm="hf-s3-gateway"`)
-		c.AbortWithStatus(http.StatusUnauthorized)
 	}
 }
 
@@ -45,4 +68,162 @@ func validBasicAuth(header string) bool {
 	userOK := subtle.ConstantTimeCompare([]byte(parts[0]), []byte(getenv("S3_ACCESS_KEY", "openlist"))) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(parts[1]), []byte(getenv("S3_SECRET_KEY", "change-me"))) == 1
 	return userOK && passOK
+}
+
+type sigV4Auth struct {
+	AccessKey     string
+	Date          string
+	Region        string
+	Service       string
+	SignedHeaders []string
+	Signature     string
+}
+
+func validateSigV4(r *http.Request) error {
+	authz := r.Header.Get("Authorization")
+	parsed, err := parseSigV4Authorization(authz)
+	if err != nil {
+		return err
+	}
+	if parsed.AccessKey != getenv("S3_ACCESS_KEY", "openlist") {
+		return fmt.Errorf("invalid access key")
+	}
+	if parsed.Service != "s3" {
+		return fmt.Errorf("unsupported service %q", parsed.Service)
+	}
+	amzDate := r.Header.Get("X-Amz-Date")
+	if amzDate == "" {
+		return fmt.Errorf("missing X-Amz-Date")
+	}
+	if _, err := time.Parse("20060102T150405Z", amzDate); err != nil {
+		return fmt.Errorf("invalid X-Amz-Date")
+	}
+	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
+	if payloadHash == "" {
+		payloadHash = "UNSIGNED-PAYLOAD"
+	}
+
+	canonHeaders, signedHeaderNames, err := buildCanonicalHeaders(r, parsed.SignedHeaders)
+	if err != nil {
+		return err
+	}
+	canonReq := strings.Join([]string{
+		r.Method,
+		canonicalURI(r.URL.Path),
+		canonicalQueryString(r.URL.RawQuery),
+		canonHeaders,
+		strings.Join(signedHeaderNames, ";"),
+		payloadHash,
+	}, "\n")
+	hashedCanonReq := hexSHA256([]byte(canonReq))
+	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", parsed.Date, parsed.Region, parsed.Service)
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		amzDate,
+		credentialScope,
+		hashedCanonReq,
+	}, "\n")
+	derived := deriveSigV4Key(getenv("S3_SECRET_KEY", "change-me"), parsed.Date, parsed.Region, parsed.Service)
+	expectedSig := hex.EncodeToString(hmacSHA256(derived, stringToSign))
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(parsed.Signature)) != 1 {
+		return fmt.Errorf("signature mismatch")
+	}
+	return nil
+}
+
+func parseSigV4Authorization(v string) (*sigV4Auth, error) {
+	if !strings.HasPrefix(v, "AWS4-HMAC-SHA256 ") {
+		return nil, fmt.Errorf("unsupported authorization scheme")
+	}
+	rest := strings.TrimPrefix(v, "AWS4-HMAC-SHA256 ")
+	parts := strings.Split(rest, ",")
+	m := map[string]string{}
+	for _, p := range parts {
+		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		m[kv[0]] = strings.Trim(kv[1], " ")
+	}
+	cred := m["Credential"]
+	signed := m["SignedHeaders"]
+	sig := m["Signature"]
+	if cred == "" || signed == "" || sig == "" {
+		return nil, fmt.Errorf("malformed authorization header")
+	}
+	credParts := strings.Split(cred, "/")
+	if len(credParts) != 5 {
+		return nil, fmt.Errorf("invalid credential scope")
+	}
+	return &sigV4Auth{
+		AccessKey:     credParts[0],
+		Date:          credParts[1],
+		Region:        credParts[2],
+		Service:       credParts[3],
+		SignedHeaders: strings.Split(strings.ToLower(signed), ";"),
+		Signature:     strings.ToLower(sig),
+	}, nil
+}
+
+func buildCanonicalHeaders(r *http.Request, signed []string) (string, []string, error) {
+	if len(signed) == 0 {
+		return "", nil, fmt.Errorf("missing signed headers")
+	}
+	names := append([]string(nil), signed...)
+	sort.Strings(names)
+	lines := make([]string, 0, len(names))
+	for _, name := range names {
+		value := headerValue(r, name)
+		if value == "" {
+			return "", nil, fmt.Errorf("missing signed header %q", name)
+		}
+		lines = append(lines, name+":"+normalizeHeaderValue(value))
+	}
+	return strings.Join(lines, "\n") + "\n", names, nil
+}
+
+func headerValue(r *http.Request, name string) string {
+	name = strings.ToLower(name)
+	if name == "host" {
+		return r.Host
+	}
+	return r.Header.Get(name)
+}
+
+func normalizeHeaderValue(v string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(v)), " ")
+}
+
+func canonicalURI(path string) string {
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
+func canonicalQueryString(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "&")
+	sort.Strings(parts)
+	return strings.Join(parts, "&")
+}
+
+func deriveSigV4Key(secret, date, region, service string) []byte {
+	kDate := hmacSHA256([]byte("AWS4"+secret), date)
+	kRegion := hmacSHA256(kDate, region)
+	kService := hmacSHA256(kRegion, service)
+	return hmacSHA256(kService, "aws4_request")
+}
+
+func hmacSHA256(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	_, _ = h.Write([]byte(data))
+	return h.Sum(nil)
+}
+
+func hexSHA256(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
