@@ -6,18 +6,30 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
+var (
+	errNoSuchUpload   = errors.New("no such multipart upload")
+	errInvalidPart    = errors.New("invalid multipart part")
+	errInvalidPartOrd = errors.New("invalid multipart part order")
+	errEntityTooSmall = errors.New("multipart part too small")
+)
+
 type multipartStore struct {
-	root string
+	root  string
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
 }
 
 type multipartUpload struct {
@@ -65,7 +77,19 @@ type completeMultipartUploadResult struct {
 func newMultipartStore() *multipartStore {
 	root := filepath.Join(dataRoot(), ".multipart")
 	_ = os.MkdirAll(root, 0o755)
-	return &multipartStore{root: root}
+	return &multipartStore{root: root, locks: map[string]*sync.Mutex{}}
+}
+
+func (m *multipartStore) lock(uploadID string) func() {
+	m.mu.Lock()
+	l, ok := m.locks[uploadID]
+	if !ok {
+		l = &sync.Mutex{}
+		m.locks[uploadID] = l
+	}
+	m.mu.Unlock()
+	l.Lock()
+	return l.Unlock
 }
 
 func (m *multipartStore) create(bucket, key string) (*multipartUpload, error) {
@@ -91,7 +115,7 @@ func (m *multipartStore) load(uploadID string) (*multipartUpload, error) {
 	b, err := os.ReadFile(filepath.Join(m.root, uploadID, "meta.json"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, errNotFound
+			return nil, errNoSuchUpload
 		}
 		return nil, err
 	}
@@ -118,6 +142,12 @@ func (m *multipartStore) save(u *multipartUpload) error {
 }
 
 func (m *multipartStore) abort(uploadID string) error {
+	unlock := m.lock(uploadID)
+	defer unlock()
+	return m.abortUnlocked(uploadID)
+}
+
+func (m *multipartStore) abortUnlocked(uploadID string) error {
 	err := os.RemoveAll(filepath.Join(m.root, uploadID))
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -127,6 +157,9 @@ func (m *multipartStore) abort(uploadID string) error {
 
 func (m *multipartStore) putPart(ctx context.Context, uploadID string, partNumber int, body io.Reader) (multipartPartMeta, error) {
 	_ = ctx
+	unlock := m.lock(uploadID)
+	defer unlock()
+
 	u, err := m.load(uploadID)
 	if err != nil {
 		return multipartPartMeta{}, err
@@ -156,7 +189,14 @@ func (m *multipartStore) putPart(ctx context.Context, uploadID string, partNumbe
 		ETag:       fmt.Sprintf("\"%s\"", hex.EncodeToString(h.Sum(nil))),
 		UpdatedAt:  time.Now().UTC(),
 	}
-	u.Parts[partNumber] = part
+	if err := m.savePartMeta(uploadID, part); err != nil {
+		return multipartPartMeta{}, err
+	}
+	merged, err := m.loadPartsFromDisk(uploadID)
+	if err != nil {
+		return multipartPartMeta{}, err
+	}
+	u.Parts = merged
 	if err := m.save(u); err != nil {
 		return multipartPartMeta{}, err
 	}
@@ -164,17 +204,26 @@ func (m *multipartStore) putPart(ctx context.Context, uploadID string, partNumbe
 }
 
 func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID string, requested []completedPart) (completeMultipartUploadResult, error) {
+	unlock := m.lock(uploadID)
+	defer unlock()
+
 	u, err := m.load(uploadID)
 	if err != nil {
 		return completeMultipartUploadResult{}, err
 	}
 	if len(requested) == 0 {
-		return completeMultipartUploadResult{}, fmt.Errorf("no parts provided")
+		return completeMultipartUploadResult{}, fmt.Errorf("%w: no parts provided", errInvalidPart)
 	}
+	partsOnDisk, err := m.loadPartsFromDisk(uploadID)
+	if err != nil {
+		return completeMultipartUploadResult{}, err
+	}
+	u.Parts = partsOnDisk
+	log.Printf("multipart complete uploadId=%s key=%s requested_parts=%v stored_parts=%v", uploadID, u.Key, partNumbersOf(requested), storedPartNumbersOf(u.Parts))
 	sort.Slice(requested, func(i, j int) bool { return requested[i].PartNumber < requested[j].PartNumber })
 	for i := 1; i < len(requested); i++ {
 		if requested[i-1].PartNumber == requested[i].PartNumber {
-			return completeMultipartUploadResult{}, fmt.Errorf("duplicate part numbers")
+			return completeMultipartUploadResult{}, fmt.Errorf("%w: duplicate part numbers", errInvalidPartOrd)
 		}
 	}
 	tmpFile, err := os.CreateTemp(filepath.Join(m.root, uploadID), "assembled-*")
@@ -189,13 +238,13 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 	for idx, part := range requested {
 		meta, ok := u.Parts[part.PartNumber]
 		if !ok {
-			return completeMultipartUploadResult{}, errNotFound
+			return completeMultipartUploadResult{}, fmt.Errorf("%w: missing part %d", errInvalidPart, part.PartNumber)
 		}
 		if part.ETag != "" && strings.TrimSpace(part.ETag) != meta.ETag {
-			return completeMultipartUploadResult{}, fmt.Errorf("etag mismatch for part %d", part.PartNumber)
+			return completeMultipartUploadResult{}, fmt.Errorf("%w: etag mismatch for part %d", errInvalidPart, part.PartNumber)
 		}
 		if idx < len(requested)-1 && meta.Size < 5*1024*1024 {
-			return completeMultipartUploadResult{}, fmt.Errorf("part %d too small", part.PartNumber)
+			return completeMultipartUploadResult{}, fmt.Errorf("%w: part %d too small", errEntityTooSmall, part.PartNumber)
 		}
 		f, err := os.Open(meta.Path)
 		if err != nil {
@@ -214,7 +263,7 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 		return completeMultipartUploadResult{}, err
 	}
 	etag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(wholeHash.Sum(nil)), len(requested))
-	_ = m.abort(uploadID)
+	_ = m.abortUnlocked(uploadID)
 	return completeMultipartUploadResult{
 		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
 		Location: "/" + u.Bucket + "/" + u.Key,
@@ -222,4 +271,57 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 		Key:      u.Key,
 		ETag:     etag,
 	}, nil
+}
+
+func (m *multipartStore) savePartMeta(uploadID string, part multipartPartMeta) error {
+	metaPath := filepath.Join(m.root, uploadID, "parts", fmt.Sprintf("part-%05d.json", part.PartNumber))
+	b, err := json.MarshalIndent(part, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(metaPath, b, 0o644)
+}
+
+func (m *multipartStore) loadPartsFromDisk(uploadID string) (map[int]multipartPartMeta, error) {
+	partsDir := filepath.Join(m.root, uploadID, "parts")
+	entries, err := os.ReadDir(partsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[int]multipartPartMeta{}, nil
+		}
+		return nil, err
+	}
+	parts := map[int]multipartPartMeta{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(partsDir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var part multipartPartMeta
+		if err := json.Unmarshal(b, &part); err != nil {
+			return nil, err
+		}
+		parts[part.PartNumber] = part
+	}
+	return parts, nil
+}
+
+func partNumbersOf(parts []completedPart) []int {
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, p.PartNumber)
+	}
+	return out
+}
+
+func storedPartNumbersOf(parts map[int]multipartPartMeta) []int {
+	out := make([]int, 0, len(parts))
+	for n := range parts {
+		out = append(out, n)
+	}
+	sort.Ints(out)
+	return out
 }
