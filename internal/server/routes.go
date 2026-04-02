@@ -333,7 +333,7 @@ func decodeContinuationToken(tok string) string {
 
 func formatS3Time(t time.Time) string {
 	if t.IsZero() {
-		return ""
+		t = time.Unix(0, 0).UTC()
 	}
 	return t.UTC().Format("2006-01-02T15:04:05.000Z")
 }
