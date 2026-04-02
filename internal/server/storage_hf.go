@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,6 +119,8 @@ func normalizeHFMaps(items []map[string]any, prefix string) []ObjectInfo {
 	return out
 }
 
+var hfListTextLineRE = regexp.MustCompile(`^\s*(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.+?)\s*$`)
+
 func parseHFListText(text, prefix string) []ObjectInfo {
 	out := make([]ObjectInfo, 0)
 	s := bufio.NewScanner(strings.NewReader(text))
@@ -126,27 +129,40 @@ func parseHFListText(text, prefix string) []ObjectInfo {
 		if line == "" {
 			continue
 		}
-		fields := strings.Fields(line)
-		var key string
-		var size int64
-		for _, f := range fields {
-			cf := strings.TrimSpace(strings.Trim(f, "\"'"))
-			if strings.Contains(cf, "/") || strings.Contains(cf, ".") {
-				key = strings.TrimPrefix(cf, "/")
+		m := hfListTextLineRE.FindStringSubmatch(line)
+		if len(m) == 5 {
+			size, _ := strconv.ParseInt(m[1], 10, 64)
+			modTime, _ := time.ParseInLocation("2006-01-02 15:04:05", m[2]+" "+m[3], time.UTC)
+			key := cleanKey(strings.TrimSpace(m[4]))
+			if key == "" || strings.HasSuffix(key, "/") {
+				continue
 			}
-			if n, err := strconv.ParseInt(strings.TrimSuffix(cf, "B"), 10, 64); err == nil {
-				size = n
+			if prefix != "" && !strings.HasPrefix(key, prefix) {
+				continue
 			}
-		}
-		if key == "" {
+			out = append(out, ObjectInfo{
+				Key:          key,
+				Size:         size,
+				ModTime:      modTime.UTC(),
+				StorageClass: "STANDARD",
+			})
 			continue
 		}
-		key = cleanKey(key)
-		if strings.HasSuffix(key, "/") {
+
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		key := cleanKey(fields[len(fields)-1])
+		if key == "" || strings.HasSuffix(key, "/") {
 			continue
 		}
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			continue
+		}
+		var size int64
+		if n, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(fields[0]), "B"), 10, 64); err == nil {
+			size = n
 		}
 		out = append(out, ObjectInfo{Key: key, Size: size, StorageClass: "STANDARD"})
 	}
@@ -298,7 +314,7 @@ func (s *hfCLIStorage) DeleteObject(ctx context.Context, key string) error {
 	if err := s.cli.ensureReady(); err != nil {
 		return err
 	}
-	_, err := s.cli.run(ctx, "buckets", "rm", s.cli.bucketURI(key))
+	_, err := s.cli.run(ctx, "buckets", "rm", "-y", s.cli.bucketURI(key))
 	return err
 }
 
