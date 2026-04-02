@@ -48,7 +48,19 @@ func (c *hfCLI) ensureReady() error {
 	if _, err := exec.LookPath(c.bin); err != nil {
 		return fmt.Errorf("hf cli not found: %s", c.bin)
 	}
-	return os.MkdirAll(c.workDir, 0o755)
+	for _, dir := range []string{
+		c.workDir,
+		filepath.Join(c.workDir, "home"),
+		filepath.Join(c.workDir, ".cache"),
+		filepath.Join(c.workDir, ".config"),
+		filepath.Join(c.workDir, ".hf"),
+		filepath.Join(c.workDir, ".xet"),
+	} {
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *hfCLI) run(ctx context.Context, args ...string) ([]byte, error) {
@@ -56,6 +68,7 @@ func (c *hfCLI) run(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, c.bin, args...)
+	cmd.Dir = c.workDir
 	cmd.Env = append(os.Environ(), c.env()...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -72,8 +85,17 @@ func (c *hfCLI) run(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func (c *hfCLI) env() []string {
-	if c.token == "" {
-		return nil
+	env := []string{
+		"HOME=" + filepath.Join(c.workDir, "home"),
+		"XDG_CACHE_HOME=" + filepath.Join(c.workDir, ".cache"),
+		"XDG_CONFIG_HOME=" + filepath.Join(c.workDir, ".config"),
+		"HF_HOME=" + filepath.Join(c.workDir, ".hf"),
+		"HF_HUB_CACHE=" + filepath.Join(c.workDir, ".hf", "hub"),
+		"HF_XET_CACHE=" + filepath.Join(c.workDir, ".xet"),
+		"HF_XET_HIGH_PERFORMANCE=0",
 	}
-	return []string{"HF_TOKEN=" + c.token}
+	if c.token != "" {
+		env = append(env, "HF_TOKEN="+c.token)
+	}
+	return env
 }
