@@ -76,15 +76,17 @@ type s3Error struct {
 func RegisterRoutes(r *gin.Engine) {
 	registerHealthRoutes(r)
 	store := NewStorageFromEnv()
+	mp := newMultipartStore()
 	r.Use(authMiddleware())
 	r.GET("/", handleListBuckets)
 	r.PUT("/:bucket", handleCreateBucket)
 	r.HEAD("/:bucket", handleHeadBucket)
 	r.GET("/:bucket", handleBucketOps(store))
-	r.PUT("/:bucket/*key", handlePutObject(store))
+	r.POST("/:bucket/*key", handlePostObject(store, mp))
+	r.PUT("/:bucket/*key", handlePutObject(store, mp))
 	r.GET("/:bucket/*key", handleGetObject(store))
 	r.HEAD("/:bucket/*key", handleHeadObject(store))
-	r.DELETE("/:bucket/*key", handleDeleteObject(store))
+	r.DELETE("/:bucket/*key", handleDeleteObject(store, mp))
 }
 
 func handleListBuckets(c *gin.Context) {
@@ -194,11 +196,65 @@ func handleListObjectsV2(store Storage) gin.HandlerFunc {
 	}
 }
 
-func handlePutObject(store Storage) gin.HandlerFunc {
+func handlePostObject(store Storage, mp *multipartStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := cleanKey(c.Param("key"))
+		if key == "" {
+			writeS3Error(c, http.StatusBadRequest, "InvalidRequest", "Missing object key.")
+			return
+		}
+		if _, ok := c.GetQuery("uploads"); ok {
+			u, err := mp.create(c.Param("bucket"), key)
+			if err != nil {
+				handleStorageErr(c, err)
+				return
+			}
+			writeXML(c, http.StatusOK, initiateMultipartUploadResult{
+				Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+				Bucket:   c.Param("bucket"),
+				Key:      key,
+				UploadID: u.UploadID,
+			})
+			return
+		}
+		if uploadID := c.Query("uploadId"); uploadID != "" {
+			var req completeMultipartUpload
+			if err := xml.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+				writeS3Error(c, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate.")
+				return
+			}
+			res, err := mp.complete(c.Request.Context(), store, uploadID, req.Parts)
+			if err != nil {
+				handleMultipartErr(c, err)
+				return
+			}
+			writeXML(c, http.StatusOK, res)
+			return
+		}
+		c.Status(http.StatusNotFound)
+	}
+}
+
+func handlePutObject(store Storage, mp *multipartStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := cleanKey(c.Param("key"))
 		if key == "" {
 			c.Status(http.StatusBadRequest)
+			return
+		}
+		if uploadID := c.Query("uploadId"); uploadID != "" {
+			partNumber, err := strconv.Atoi(c.Query("partNumber"))
+			if err != nil || partNumber <= 0 {
+				writeS3Error(c, http.StatusBadRequest, "InvalidArgument", "Invalid partNumber.")
+				return
+			}
+			part, err := mp.putPart(c.Request.Context(), uploadID, partNumber, c.Request.Body)
+			if err != nil {
+				handleMultipartErr(c, err)
+				return
+			}
+			c.Header("ETag", part.ETag)
+			c.Status(http.StatusOK)
 			return
 		}
 		if err := store.PutObject(c.Request.Context(), key, c.Request.Body); err != nil {
@@ -247,8 +303,16 @@ func handleHeadObject(store Storage) gin.HandlerFunc {
 	}
 }
 
-func handleDeleteObject(store Storage) gin.HandlerFunc {
+func handleDeleteObject(store Storage, mp *multipartStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if uploadID := c.Query("uploadId"); uploadID != "" {
+			if err := mp.abort(uploadID); err != nil {
+				handleMultipartErr(c, err)
+				return
+			}
+			c.Status(http.StatusNoContent)
+			return
+		}
 		if err := store.DeleteObject(c.Request.Context(), cleanKey(c.Param("key"))); err != nil {
 			handleStorageErr(c, err)
 			return
@@ -296,6 +360,27 @@ func handleStorageErr(c *gin.Context, err error) {
 		writeS3Error(c, http.StatusNotImplemented, "NotImplemented", err.Error())
 	default:
 		writeS3Error(c, http.StatusInternalServerError, "InternalError", err.Error())
+	}
+}
+
+func handleMultipartErr(c *gin.Context, err error) {
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	switch {
+	case errors.Is(err, errNotFound), strings.Contains(msg, "NoSuchUpload"):
+		writeS3Error(c, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
+	case strings.Contains(msg, "etag mismatch"):
+		writeS3Error(c, http.StatusBadRequest, "InvalidPart", msg)
+	case strings.Contains(msg, "duplicate part"):
+		writeS3Error(c, http.StatusBadRequest, "InvalidPartOrder", msg)
+	case strings.Contains(msg, "too small"):
+		writeS3Error(c, http.StatusBadRequest, "EntityTooSmall", msg)
+	case strings.Contains(msg, "Invalid part number"), strings.Contains(msg, "invalid part number"):
+		writeS3Error(c, http.StatusBadRequest, "InvalidArgument", msg)
+	default:
+		writeS3Error(c, http.StatusInternalServerError, "InternalError", msg)
 	}
 }
 
