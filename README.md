@@ -2,7 +2,7 @@
 
 一个面向 **Hugging Face Buckets** 的轻量级 **S3 兼容网关**，用于让 OpenList 等只支持 S3 的工具，通过标准化的 S3 接口访问 HF Bucket。
 
-> 当前目标场景：将 `hf://buckets/XKeiran/hf-s3` 暴露为 OpenList 可接入的 S3 存储。
+> 目标场景：将 `hf://buckets/<your-namespace>/<your-bucket>` 暴露为 OpenList 可接入的 S3 存储。
 
 ---
 
@@ -72,13 +72,13 @@ docker compose up -d
 启动后检查：
 
 ```bash
-curl -u 'Keiran:Zhl20020713!' http://127.0.0.1:9000/healthz
+curl -u '<access-key>:<secret-key>' http://127.0.0.1:9000/healthz
 ```
 
 如果返回类似：
 
 ```json
-{"backend":"hf","bucket":"hf-s3","namespace":"XKeiran","ok":true}
+{"backend":"hf","bucket":"<your-bucket>","namespace":"<your-namespace>","ok":true}
 ```
 
 说明服务已经正常连接到 Hugging Face Bucket。
@@ -96,10 +96,10 @@ services:
     environment:
       APP_ADDR: ":9000"
       STORAGE_BACKEND: "hf"
-      S3_ACCESS_KEY: "Keiran"
-      S3_SECRET_KEY: "your-secret"
-      HF_NAMESPACE: "XKeiran"
-      HF_BUCKET: "hf-s3"
+      S3_ACCESS_KEY: "your-access-key"
+      S3_SECRET_KEY: "your-secret-key"
+      HF_NAMESPACE: "your-namespace"
+      HF_BUCKET: "your-bucket"
       HF_TOKEN: "hf_xxx"
       DATA_DIR: "/data"
     volumes:
@@ -110,6 +110,7 @@ services:
 
 - `./data` 目录需要容器用户可写，否则 HF 临时目录（如 `/data/.hf-tmp`）创建失败会导致列目录/上传报错
 - 如果使用挂载目录，确保权限允许容器内用户写入
+- 不要把真实 `HF_TOKEN`、访问密钥、命名空间、桶名直接写进公开仓库文档
 
 ---
 
@@ -118,9 +119,9 @@ services:
 在 OpenList 中添加 S3 存储时可参考：
 
 - Endpoint: `http://your-host:9000`
-- Access Key ID: `Keiran`
-- Secret Access Key: `your-secret`
-- Bucket: `hf-s3`
+- Access Key ID: `your-access-key`
+- Secret Access Key: `your-secret-key`
+- Bucket: `your-bucket`
 - Region: `auto`
 - Force Path Style: `true`
 
@@ -142,6 +143,10 @@ GitHub Actions 会构建：
 ## English
 
 A lightweight S3-compatible gateway for exposing Hugging Face Buckets to S3-only tools such as OpenList.
+
+Target use case:
+
+- expose `hf://buckets/<your-namespace>/<your-bucket>` through an S3-compatible endpoint
 
 Current focus:
 
