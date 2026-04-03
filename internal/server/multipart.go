@@ -226,15 +226,9 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 			return completeMultipartUploadResult{}, fmt.Errorf("%w: duplicate part numbers", errInvalidPartOrd)
 		}
 	}
-	tmpFile, err := os.CreateTemp(filepath.Join(m.root, uploadID), "assembled-*")
-	if err != nil {
-		return completeMultipartUploadResult{}, err
-	}
-	assembledPath := tmpFile.Name()
-	defer os.Remove(assembledPath)
-	defer tmpFile.Close()
+	var readers []io.Reader
+	var openFiles []*os.File
 	wholeHash := md5.New()
-	mw := io.MultiWriter(tmpFile, wholeHash)
 	for idx, part := range requested {
 		meta, ok := u.Parts[part.PartNumber]
 		if !ok {
@@ -248,18 +242,21 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 		}
 		f, err := os.Open(meta.Path)
 		if err != nil {
+			for _, of := range openFiles {
+				_ = of.Close()
+			}
 			return completeMultipartUploadResult{}, err
 		}
-		if _, err := io.Copy(mw, f); err != nil {
+		openFiles = append(openFiles, f)
+		readers = append(readers, io.TeeReader(f, wholeHash))
+	}
+	defer func() {
+		for _, f := range openFiles {
 			_ = f.Close()
-			return completeMultipartUploadResult{}, err
 		}
-		_ = f.Close()
-	}
-	if _, err := tmpFile.Seek(0, 0); err != nil {
-		return completeMultipartUploadResult{}, err
-	}
-	if err := store.PutObject(ctx, u.Key, tmpFile); err != nil {
+	}()
+	log.Printf("multipart complete stream uploadId=%s key=%s parts=%d mode=stream-to-hf", uploadID, u.Key, len(requested))
+	if err := store.PutObject(ctx, u.Key, io.MultiReader(readers...)); err != nil {
 		return completeMultipartUploadResult{}, err
 	}
 	etag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(wholeHash.Sum(nil)), len(requested))

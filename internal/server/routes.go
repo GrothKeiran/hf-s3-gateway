@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -204,6 +205,7 @@ func handlePostObject(store Storage, mp *multipartStore) gin.HandlerFunc {
 			return
 		}
 		if _, ok := c.GetQuery("uploads"); ok {
+			log.Printf("s3 multipart start bucket=%s key=%s", c.Param("bucket"), key)
 			u, err := mp.create(c.Param("bucket"), key)
 			if err != nil {
 				handleStorageErr(c, err)
@@ -248,6 +250,7 @@ func handlePutObject(store Storage, mp *multipartStore) gin.HandlerFunc {
 				writeS3Error(c, http.StatusBadRequest, "InvalidArgument", "Invalid partNumber.")
 				return
 			}
+			log.Printf("s3 multipart part uploadId=%s key=%s part=%d content_length=%d", uploadID, key, partNumber, c.Request.ContentLength)
 			part, err := mp.putPart(c.Request.Context(), uploadID, partNumber, c.Request.Body)
 			if err != nil {
 				handleMultipartErr(c, err)
@@ -267,7 +270,15 @@ func handlePutObject(store Storage, mp *multipartStore) gin.HandlerFunc {
 
 func handleGetObject(store Storage) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, meta, err := store.GetObject(c.Request.Context(), cleanKey(c.Param("key")))
+		key := cleanKey(c.Param("key"))
+		if redirectStore, ok := store.(RedirectURLStorage); ok && hfSDKEnabled("HF_REDIRECT_GET", true) {
+			if url, err := redirectStore.SignedGetURL(c.Request.Context(), key); err == nil && url != "" {
+				c.Redirect(http.StatusTemporaryRedirect, url)
+				return
+			}
+		}
+
+		body, meta, err := store.GetObject(c.Request.Context(), key)
 		if err != nil {
 			handleStorageErr(c, err)
 			return
@@ -369,13 +380,13 @@ func handleMultipartErr(c *gin.Context, err error) {
 	}
 	msg := err.Error()
 	switch {
-	case errors.Is(err, errNotFound), strings.Contains(msg, "NoSuchUpload"):
+	case errors.Is(err, errNoSuchUpload), strings.Contains(msg, "NoSuchUpload"):
 		writeS3Error(c, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
-	case strings.Contains(msg, "etag mismatch"):
+	case errors.Is(err, errInvalidPart), strings.Contains(msg, "etag mismatch"), strings.Contains(msg, "missing part"):
 		writeS3Error(c, http.StatusBadRequest, "InvalidPart", msg)
-	case strings.Contains(msg, "duplicate part"):
+	case errors.Is(err, errInvalidPartOrd), strings.Contains(msg, "duplicate part"):
 		writeS3Error(c, http.StatusBadRequest, "InvalidPartOrder", msg)
-	case strings.Contains(msg, "too small"):
+	case errors.Is(err, errEntityTooSmall), strings.Contains(msg, "too small"):
 		writeS3Error(c, http.StatusBadRequest, "EntityTooSmall", msg)
 	case strings.Contains(msg, "Invalid part number"), strings.Contains(msg, "invalid part number"):
 		writeS3Error(c, http.StatusBadRequest, "InvalidArgument", msg)

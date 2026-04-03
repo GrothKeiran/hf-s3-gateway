@@ -25,6 +25,10 @@ type Storage interface {
 	DeleteObject(ctx context.Context, key string) error
 }
 
+type RedirectURLStorage interface {
+	SignedGetURL(ctx context.Context, key string) (string, error)
+}
+
 func NewStorageFromEnv() Storage {
 	switch getenv("STORAGE_BACKEND", "local") {
 	case "hf":

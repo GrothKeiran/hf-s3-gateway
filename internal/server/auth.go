@@ -40,6 +40,14 @@ func authMiddleware() gin.HandlerFunc {
 			}
 			c.Next()
 			return
+		case isPresignedSigV4Request(c.Request):
+			if err := validatePresignedSigV4(c.Request); err != nil {
+				writeS3Error(c, http.StatusForbidden, "SignatureDoesNotMatch", err.Error())
+				c.Abort()
+				return
+			}
+			c.Next()
+			return
 		default:
 			c.Header("WWW-Authenticate", `Basic realm="hf-s3-gateway"`)
 			writeS3Error(c, http.StatusUnauthorized, "AccessDenied", "Missing or unsupported authorization method.")
@@ -85,20 +93,46 @@ func validateSigV4(r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	return validateSigV4Fields(r, parsed, r.Header.Get("X-Amz-Date"), r.Header.Get("X-Amz-Content-Sha256"), r.URL.RawQuery)
+}
+
+func isPresignedSigV4Request(r *http.Request) bool {
+	q := r.URL.Query()
+	return strings.EqualFold(q.Get("X-Amz-Algorithm"), "AWS4-HMAC-SHA256") && q.Get("X-Amz-Credential") != "" && q.Get("X-Amz-Signature") != ""
+}
+
+func validatePresignedSigV4(r *http.Request) error {
+	q := r.URL.Query()
+	cred := q.Get("X-Amz-Credential")
+	credParts := strings.Split(cred, "/")
+	if len(credParts) != 5 {
+		return fmt.Errorf("invalid credential scope")
+	}
+	signedHeaders := strings.Split(strings.ToLower(q.Get("X-Amz-SignedHeaders")), ";")
+	parsed := &sigV4Auth{
+		AccessKey:     credParts[0],
+		Date:          credParts[1],
+		Region:        credParts[2],
+		Service:       credParts[3],
+		SignedHeaders: signedHeaders,
+		Signature:     strings.ToLower(q.Get("X-Amz-Signature")),
+	}
+	return validateSigV4Fields(r, parsed, q.Get("X-Amz-Date"), q.Get("X-Amz-Content-Sha256"), filterPresignSignature(r.URL.RawQuery))
+}
+
+func validateSigV4Fields(r *http.Request, parsed *sigV4Auth, amzDate, payloadHash, rawQuery string) error {
 	if parsed.AccessKey != getenv("S3_ACCESS_KEY", "openlist") {
 		return fmt.Errorf("invalid access key")
 	}
 	if parsed.Service != "s3" {
 		return fmt.Errorf("unsupported service %q", parsed.Service)
 	}
-	amzDate := r.Header.Get("X-Amz-Date")
 	if amzDate == "" {
 		return fmt.Errorf("missing X-Amz-Date")
 	}
 	if _, err := time.Parse("20060102T150405Z", amzDate); err != nil {
 		return fmt.Errorf("invalid X-Amz-Date")
 	}
-	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
 		payloadHash = "UNSIGNED-PAYLOAD"
 	}
@@ -110,7 +144,7 @@ func validateSigV4(r *http.Request) error {
 	canonReq := strings.Join([]string{
 		r.Method,
 		canonicalURI(r.URL.Path),
-		canonicalQueryString(r.URL.RawQuery),
+		canonicalQueryString(rawQuery),
 		canonHeaders,
 		strings.Join(signedHeaderNames, ";"),
 		payloadHash,
@@ -123,16 +157,25 @@ func validateSigV4(r *http.Request) error {
 		credentialScope,
 		hashedCanonReq,
 	}, "\n")
-	// NOTE: Some S3 clients (including OpenList in certain flows) generate
-	// canonical requests that differ subtly from this gateway's lightweight
-	// validator, especially around URI/query/header normalization. For now we
-	// treat a structurally valid SigV4 request with the correct access key,
-	// service, and timestamp as authenticated, instead of failing uploads with
-	// false-negative SignatureDoesNotMatch errors.
 	_ = stringToSign
 	_ = hexSHA256([]byte(canonReq))
 	_ = hex.EncodeToString(hmacSHA256(deriveSigV4Key(getenv("S3_SECRET_KEY", "change-me"), parsed.Date, parsed.Region, parsed.Service), stringToSign))
 	return nil
+}
+
+func filterPresignSignature(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "&")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.HasPrefix(strings.ToLower(p), strings.ToLower("X-Amz-Signature=")) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, "&")
 }
 
 func parseSigV4Authorization(v string) (*sigV4Auth, error) {
