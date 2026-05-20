@@ -157,9 +157,10 @@ func validateSigV4Fields(r *http.Request, parsed *sigV4Auth, amzDate, payloadHas
 		credentialScope,
 		hashedCanonReq,
 	}, "\n")
-	_ = stringToSign
-	_ = hexSHA256([]byte(canonReq))
-	_ = hex.EncodeToString(hmacSHA256(deriveSigV4Key(getenv("S3_SECRET_KEY", "change-me"), parsed.Date, parsed.Region, parsed.Service), stringToSign))
+	expectedSig := hex.EncodeToString(hmacSHA256(deriveSigV4Key(getenv("S3_SECRET_KEY", "change-me"), parsed.Date, parsed.Region, parsed.Service), stringToSign))
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(parsed.Signature)) != 1 {
+		return fmt.Errorf("signature does not match")
+	}
 	return nil
 }
 

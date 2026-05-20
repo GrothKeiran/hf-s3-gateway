@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,7 +20,8 @@ import (
 )
 
 type hfCLIStorage struct {
-	cli *hfCLI
+	cli    *hfCLI
+	bridge *PythonBridge
 }
 
 type hfPyListResult struct {
@@ -32,7 +34,11 @@ const (
 )
 
 func newHFPlaceholderStorage() Storage {
-	return &hfCLIStorage{cli: newHFCLIFromEnv()}
+	cli := newHFCLIFromEnv()
+	return &hfCLIStorage{
+		cli:    cli,
+		bridge: newPythonBridge(cli),
+	}
 }
 
 func hfSDKEnabled(name string, fallback bool) bool {
@@ -67,7 +73,6 @@ func (s *hfCLIStorage) ListObjects(ctx context.Context, prefix string) ([]Object
 		return nil, err
 	}
 	prefix = cleanKey(prefix)
-
 	if hfSDKEnabled("HF_SDK_LIST", true) {
 		if items, err := s.listObjectsViaPython(ctx, prefix); err == nil {
 			sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
@@ -194,7 +199,6 @@ func parseHFListText(text, prefix string) []ObjectInfo {
 			})
 			continue
 		}
-
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
@@ -296,7 +300,6 @@ func (s *hfCLIStorage) PutObject(ctx context.Context, key string, body io.Reader
 		_, _ = io.Copy(io.Discard, body)
 		return err
 	}
-
 	putMax := hfSDKMaxBytes("HF_SDK_PUT_MAX_BYTES", defaultHFSDKPutMaxBytes)
 	if hfSDKEnabled("HF_SDK_PUT", true) && putMax > 0 {
 		limited := &io.LimitedReader{R: body, N: putMax + 1}
@@ -315,7 +318,6 @@ func (s *hfCLIStorage) PutObject(ctx context.Context, key string, body io.Reader
 		log.Printf("hf put key=%s mode=cli-stream size_gt=%d", cleanKey(key), putMax)
 		return s.putObjectViaCLIStream(ctx, key, io.MultiReader(bytes.NewReader(data), body))
 	}
-
 	log.Printf("hf put key=%s mode=cli-stream no-sdk-threshold", cleanKey(key))
 	return s.putObjectViaCLIStream(ctx, key, body)
 }
@@ -334,6 +336,12 @@ func (s *hfCLIStorage) GetObject(ctx context.Context, key string) (io.ReadCloser
 }
 
 func (s *hfCLIStorage) HeadObject(ctx context.Context, key string) (ObjectInfo, error) {
+	key = cleanKey(key)
+	// Fast path: metadata-only call via bridge (no file download)
+	if meta, err := s.getObjectMetaViaPython(ctx, key); err == nil {
+		return meta, nil
+	}
+	// Slow path: fall back to full GetObject (downloads entire file)
 	body, meta, err := s.GetObject(ctx, key)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -355,36 +363,19 @@ func (s *hfCLIStorage) DeleteObject(ctx context.Context, key string) error {
 	return err
 }
 
-func (s *hfCLIStorage) listObjectsViaPython(ctx context.Context, prefix string) ([]ObjectInfo, error) {
-	code := `
-import json
-from huggingface_hub import HfApi
+// --- Bridge-based Python SDK methods ---
 
-api = HfApi(token=None)
-items = []
-for item in api.list_bucket_tree(bucket_id="__BUCKET_ID__", prefix=__PREFIX_JSON__, recursive=True):
-    if getattr(item, "type", "file") != "file":
-        continue
-    last_modified = getattr(item, "last_modified", None)
-    if hasattr(last_modified, "isoformat"):
-        last_modified = last_modified.isoformat()
-    items.append({
-        "Key": getattr(item, "path", ""),
-        "Size": int(getattr(item, "size", 0) or 0),
-        "ModTime": last_modified or "",
-        "ETag": "",
-        "StorageClass": "STANDARD",
-    })
-print(json.dumps({"items": items}, ensure_ascii=False))
-`
-	code = strings.ReplaceAll(code, "__BUCKET_ID__", s.cli.namespace+"/"+s.cli.bucket)
-	code = strings.ReplaceAll(code, "__PREFIX_JSON__", strconv.Quote(prefix))
-	out, err := s.runPython(ctx, code)
+func (s *hfCLIStorage) listObjectsViaPython(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	params := map[string]string{
+		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
+		"prefix":    prefix,
+	}
+	result, err := s.bridge.call(ctx, "list_objects", params)
 	if err != nil {
 		return nil, err
 	}
 	var res hfPyListResult
-	if err := json.Unmarshal(out, &res); err != nil {
+	if err := json.Unmarshal(result, &res); err != nil {
 		return nil, err
 	}
 	for i := range res.Items {
@@ -397,15 +388,11 @@ print(json.dumps({"items": items}, ensure_ascii=False))
 }
 
 func (s *hfCLIStorage) deleteObjectViaPython(ctx context.Context, key string) error {
-	code := `
-from huggingface_hub import HfApi
-api = HfApi(token=None)
-api.batch_bucket_files(bucket_id="__BUCKET_ID__", delete=[__KEY_JSON__])
-print("ok")
-`
-	code = strings.ReplaceAll(code, "__BUCKET_ID__", s.cli.namespace+"/"+s.cli.bucket)
-	code = strings.ReplaceAll(code, "__KEY_JSON__", strconv.Quote(cleanKey(key)))
-	_, err := s.runPython(ctx, code)
+	params := map[string]string{
+		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
+		"key":       cleanKey(key),
+	}
+	_, err := s.bridge.call(ctx, "delete_object", params)
 	return err
 }
 
@@ -413,22 +400,11 @@ func (s *hfCLIStorage) SignedGetURL(ctx context.Context, key string) (string, er
 	if err := s.cli.ensureReady(); err != nil {
 		return "", err
 	}
-	code := `
-import json
-from huggingface_hub import HfFileSystem
-fs = HfFileSystem(token=None)
-path = "buckets/__BUCKET_ID__/__KEY__"
-url = ""
-err = ""
-try:
-    url = fs.sign(path)
-except Exception as e:
-    err = str(e)
-print(json.dumps({"url": url or "", "err": err}, ensure_ascii=False))
-`
-	code = strings.ReplaceAll(code, "__BUCKET_ID__", s.cli.namespace+"/"+s.cli.bucket)
-	code = strings.ReplaceAll(code, "__KEY__", strings.ReplaceAll(cleanKey(key), "\\", "\\\\"))
-	out, err := s.runPython(ctx, code)
+	params := map[string]string{
+		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
+		"key":       cleanKey(key),
+	}
+	result, err := s.bridge.call(ctx, "signed_url", params)
 	if err != nil {
 		return "", err
 	}
@@ -436,7 +412,7 @@ print(json.dumps({"url": url or "", "err": err}, ensure_ascii=False))
 		URL string `json:"url"`
 		Err string `json:"err"`
 	}
-	if err := json.Unmarshal(out, &res); err != nil {
+	if err := json.Unmarshal(result, &res); err != nil {
 		return "", err
 	}
 	url := strings.TrimSpace(res.URL)
@@ -452,6 +428,82 @@ print(json.dumps({"url": url or "", "err": err}, ensure_ascii=False))
 	log.Printf("hf get key=%s mode=redirect url=%s", cleanKey(key), url)
 	return url, nil
 }
+
+func (s *hfCLIStorage) putObjectViaPythonBytes(ctx context.Context, key string, data []byte) error {
+	params := map[string]string{
+		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
+		"key":       cleanKey(key),
+		"data_b64":  base64.StdEncoding.EncodeToString(data),
+	}
+	_, err := s.bridge.call(ctx, "put_object", params)
+	return err
+}
+
+func (s *hfCLIStorage) getObjectMetaViaPython(ctx context.Context, key string) (ObjectInfo, error) {
+	params := map[string]string{
+		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
+		"key":       cleanKey(key),
+	}
+	result, err := s.bridge.call(ctx, "get_meta", params)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	var res struct {
+		Key     string `json:"key"`
+		Size    int64  `json:"size"`
+		ModTime string `json:"mod_time"`
+		ETag    string `json:"etag"`
+	}
+	if err := json.Unmarshal(result, &res); err != nil {
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{
+		Key:          cleanKey(res.Key),
+		Size:         res.Size,
+		ModTime:      parseTimeString(res.ModTime),
+		ETag:         quoteETag(res.ETag),
+		StorageClass: "STANDARD",
+	}, nil
+}
+
+func (s *hfCLIStorage) getObjectViaPython(ctx context.Context, key string, maxBytes int64) (io.ReadCloser, ObjectInfo, error) {
+	params := map[string]interface{}{
+		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
+		"key":       cleanKey(key),
+		"max_bytes": maxBytes,
+	}
+	result, err := s.bridge.call(ctx, "get_object", params)
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	var res struct {
+		Key     string `json:"key"`
+		Size    int64  `json:"size"`
+		ModTime string `json:"mod_time"`
+		ETag    string `json:"etag"`
+		DataB64 string `json:"data_b64"`
+	}
+	if err := json.Unmarshal(result, &res); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	data, err := base64.StdEncoding.DecodeString(res.DataB64)
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	meta := ObjectInfo{
+		Key:          cleanKey(res.Key),
+		Size:         res.Size,
+		ModTime:      parseTimeString(res.ModTime),
+		ETag:         quoteETag(res.ETag),
+		StorageClass: "STANDARD",
+	}
+	if meta.Size == 0 {
+		meta.Size = int64(len(data))
+	}
+	return io.NopCloser(bytes.NewReader(data)), meta, nil
+}
+
+// --- CLI stream methods (unchanged) ---
 
 func (s *hfCLIStorage) putObjectViaCLIStream(ctx context.Context, key string, body io.Reader) error {
 	if err := s.cli.ensureReady(); err != nil {
@@ -502,6 +554,7 @@ func (s *hfCLIStorage) putObjectViaCLIStream(ctx context.Context, key string, bo
 
 func (s *hfCLIStorage) getObjectViaCLIStream(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
 	meta, metaErr := s.getObjectMetaViaPython(ctx, key)
+
 	cmd := exec.CommandContext(ctx, s.cli.bin, "buckets", "cp", s.cli.bucketURI(key), "-")
 	cmd.Dir = s.cli.workDir
 	cmd.Env = append(os.Environ(), s.cli.env()...)
@@ -514,6 +567,7 @@ func (s *hfCLIStorage) getObjectViaCLIStream(ctx context.Context, key string) (i
 	if err := cmd.Start(); err != nil {
 		return nil, ObjectInfo{}, err
 	}
+
 	if metaErr != nil {
 		meta = ObjectInfo{Key: cleanKey(key), StorageClass: "STANDARD"}
 	}
@@ -521,231 +575,8 @@ func (s *hfCLIStorage) getObjectViaCLIStream(ctx context.Context, key string) (i
 		meta.Key = cleanKey(key)
 		meta.StorageClass = "STANDARD"
 	}
+
 	return &cmdReadCloser{ReadCloser: stdout, cmd: cmd, stderr: &stderr}, meta, nil
-}
-
-func (s *hfCLIStorage) getObjectMetaViaPython(ctx context.Context, key string) (ObjectInfo, error) {
-	code := `
-import json
-from huggingface_hub import HfFileSystem
-fs = HfFileSystem(token=None)
-info = fs.info("buckets/__BUCKET_ID__/__KEY__")
-last_modified = info.get("last_modified") or info.get("LastModified") or ""
-if hasattr(last_modified, "isoformat"):
-    last_modified = last_modified.isoformat()
-print(json.dumps({
-    "key": __KEY_JSON__,
-    "size": int(info.get("size", 0) or 0),
-    "mod_time": last_modified,
-    "etag": info.get("etag", "") or "",
-}, ensure_ascii=False))
-`
-	code = strings.ReplaceAll(code, "__BUCKET_ID__", s.cli.namespace+"/"+s.cli.bucket)
-	code = strings.ReplaceAll(code, "__KEY__", strings.ReplaceAll(cleanKey(key), "\\", "\\\\"))
-	code = strings.ReplaceAll(code, "__KEY_JSON__", strconv.Quote(cleanKey(key)))
-	out, err := s.runPython(ctx, code)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	var res struct {
-		Key     string `json:"key"`
-		Size    int64  `json:"size"`
-		ModTime string `json:"mod_time"`
-		ETag    string `json:"etag"`
-	}
-	if err := json.Unmarshal(out, &res); err != nil {
-		return ObjectInfo{}, err
-	}
-	return ObjectInfo{
-		Key:          cleanKey(res.Key),
-		Size:         res.Size,
-		ModTime:      parseTimeString(res.ModTime),
-		ETag:         quoteETag(res.ETag),
-		StorageClass: "STANDARD",
-	}, nil
-}
-
-func (s *hfCLIStorage) putObjectViaPythonBytes(ctx context.Context, key string, data []byte) error {
-	code := `
-import base64
-from huggingface_hub import HfApi
-api = HfApi(token=None)
-api.batch_bucket_files(bucket_id="__BUCKET_ID__", add=[(base64.b64decode(__DATA_B64__), __KEY_JSON__)])
-print("ok")
-`
-	code = strings.ReplaceAll(code, "__BUCKET_ID__", s.cli.namespace+"/"+s.cli.bucket)
-	code = strings.ReplaceAll(code, "__KEY_JSON__", strconv.Quote(cleanKey(key)))
-	code = strings.ReplaceAll(code, "__DATA_B64__", strconv.Quote(encodeBase64(data)))
-	_, err := s.runPython(ctx, code)
-	return err
-}
-
-func (s *hfCLIStorage) getObjectViaPython(ctx context.Context, key string, maxBytes int64) (io.ReadCloser, ObjectInfo, error) {
-	code := `
-import base64
-import json
-from huggingface_hub import HfFileSystem
-
-fs = HfFileSystem(token=None)
-path = "buckets/__BUCKET_ID__/__KEY__"
-info = fs.info(path)
-size = int(info.get("size", 0) or 0)
-if __MAX_BYTES__ >= 0 and size > __MAX_BYTES__:
-    raise RuntimeError(f"object too large for sdk get path: {size} > __MAX_BYTES__")
-with fs.open(path, "rb") as f:
-    data = f.read()
-last_modified = info.get("last_modified") or info.get("LastModified") or ""
-if hasattr(last_modified, "isoformat"):
-    last_modified = last_modified.isoformat()
-print(json.dumps({
-    "key": __KEY_JSON__,
-    "size": int(info.get("size", len(data)) or len(data)),
-    "mod_time": last_modified,
-    "etag": info.get("etag", "") or "",
-    "data_b64": base64.b64encode(data).decode("ascii"),
-}, ensure_ascii=False))
-`
-	code = strings.ReplaceAll(code, "__BUCKET_ID__", s.cli.namespace+"/"+s.cli.bucket)
-	code = strings.ReplaceAll(code, "__KEY__", strings.ReplaceAll(cleanKey(key), "\\", "\\\\"))
-	code = strings.ReplaceAll(code, "__KEY_JSON__", strconv.Quote(cleanKey(key)))
-	code = strings.ReplaceAll(code, "__MAX_BYTES__", strconv.FormatInt(maxBytes, 10))
-	out, err := s.runPython(ctx, code)
-	if err != nil {
-		return nil, ObjectInfo{}, err
-	}
-	var res struct {
-		Key     string `json:"key"`
-		Size    int64  `json:"size"`
-		ModTime string `json:"mod_time"`
-		ETag    string `json:"etag"`
-		DataB64 string `json:"data_b64"`
-	}
-	if err := json.Unmarshal(out, &res); err != nil {
-		return nil, ObjectInfo{}, err
-	}
-	data, err := decodeBase64(res.DataB64)
-	if err != nil {
-		return nil, ObjectInfo{}, err
-	}
-	meta := ObjectInfo{
-		Key:          cleanKey(res.Key),
-		Size:         res.Size,
-		ModTime:      parseTimeString(res.ModTime),
-		ETag:         quoteETag(res.ETag),
-		StorageClass: "STANDARD",
-	}
-	if meta.Size == 0 {
-		meta.Size = int64(len(data))
-	}
-	return io.NopCloser(bytes.NewReader(data)), meta, nil
-}
-
-func (s *hfCLIStorage) runPython(ctx context.Context, code string) ([]byte, error) {
-	if err := s.cli.ensureReady(); err != nil {
-		return nil, err
-	}
-	cmd := exec.CommandContext(ctx, "python3", "-c", code)
-	cmd.Dir = s.cli.workDir
-	cmd.Env = append(os.Environ(), s.cli.env()...)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return nil, fmt.Errorf("hf python failed: %s", msg)
-	}
-	return stdout.Bytes(), nil
-}
-
-func encodeBase64(b []byte) string {
-	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	if len(b) == 0 {
-		return ""
-	}
-	out := make([]byte, 0, ((len(b)+2)/3)*4)
-	for i := 0; i < len(b); i += 3 {
-		var n uint32
-		remain := len(b) - i
-		n = uint32(b[i]) << 16
-		if remain > 1 {
-			n |= uint32(b[i+1]) << 8
-		}
-		if remain > 2 {
-			n |= uint32(b[i+2])
-		}
-		out = append(out,
-			table[(n>>18)&63],
-			table[(n>>12)&63],
-		)
-		if remain > 1 {
-			out = append(out, table[(n>>6)&63])
-		} else {
-			out = append(out, '=')
-		}
-		if remain > 2 {
-			out = append(out, table[n&63])
-		} else {
-			out = append(out, '=')
-		}
-	}
-	return string(out)
-}
-
-func decodeBase64(s string) ([]byte, error) {
-	dec := make([]byte, 256)
-	for i := range dec {
-		dec[i] = 0xFF
-	}
-	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	for i := 0; i < len(table); i++ {
-		dec[table[i]] = byte(i)
-	}
-	clean := strings.TrimSpace(s)
-	if clean == "" {
-		return []byte{}, nil
-	}
-	if len(clean)%4 != 0 {
-		return nil, fmt.Errorf("invalid base64 length")
-	}
-	out := make([]byte, 0, len(clean)/4*3)
-	for i := 0; i < len(clean); i += 4 {
-		c0, c1, c2, c3 := clean[i], clean[i+1], clean[i+2], clean[i+3]
-		if dec[c0] == 0xFF || dec[c1] == 0xFF {
-			return nil, fmt.Errorf("invalid base64 data")
-		}
-		n := uint32(dec[c0])<<18 | uint32(dec[c1])<<12
-		pad := 0
-		if c2 == '=' {
-			pad = 2
-		} else {
-			if dec[c2] == 0xFF {
-				return nil, fmt.Errorf("invalid base64 data")
-			}
-			n |= uint32(dec[c2]) << 6
-		}
-		if c3 == '=' {
-			if pad == 0 {
-				pad = 1
-			}
-		} else {
-			if dec[c3] == 0xFF {
-				return nil, fmt.Errorf("invalid base64 data")
-			}
-			n |= uint32(dec[c3])
-		}
-		out = append(out, byte(n>>16))
-		if pad < 2 {
-			out = append(out, byte((n>>8)&0xFF))
-		}
-		if pad == 0 {
-			out = append(out, byte(n&0xFF))
-		}
-	}
-	return out, nil
 }
 
 func parseTimeString(s string) time.Time {
