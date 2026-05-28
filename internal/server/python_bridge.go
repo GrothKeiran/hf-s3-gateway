@@ -22,6 +22,7 @@ type PythonBridge struct {
 	stdin   io.WriteCloser
 	stdout  *bufio.Scanner
 	mu      sync.Mutex
+	writeMu sync.Mutex
 	nextID  atomic.Int64
 	pending map[int64]chan bridgeResponse
 	done    chan struct{}
@@ -270,7 +271,10 @@ func (b *PythonBridge) call(ctx context.Context, method string, params interface
 		b.mu.Unlock()
 	}()
 
-	if _, err := b.stdin.Write(append(data, '\n')); err != nil {
+	b.writeMu.Lock()
+	_, err = b.stdin.Write(append(data, '\n'))
+	b.writeMu.Unlock()
+	if err != nil {
 		b.started = false
 		return nil, fmt.Errorf("bridge write: %w", err)
 	}
