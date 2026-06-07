@@ -1,6 +1,15 @@
 services:
+  init-perms:
+    image: busybox:1.36
+    command: sh -c "mkdir -p /data && chown -R 10001:10001 /data"
+    volumes:
+      - ./data:/data
+
   hf-s3-gateway:
     image: ghcr.io/grothkeiran/hf-s3-gateway:latest
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
     ports:
       - "9000:9000"
     environment:
@@ -12,6 +21,7 @@ services:
       HF_BUCKET: "your-bucket"
       HF_TOKEN: "hf_xxx"
       DATA_DIR: "/data"
+      HF_WORK_DIR: "/data/.hf-tmp"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
       interval: 30s

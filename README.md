@@ -96,8 +96,17 @@ curl -u '<access-key>:<secret-key>' http://127.0.0.1:9000/healthz
 
 ```yaml
 services:
+  init-perms:
+    image: busybox:1.36
+    command: sh -c "mkdir -p /data && chown -R 10001:10001 /data"
+    volumes:
+      - ./data:/data
+
   hf-s3-gateway:
     image: ghcr.io/grothkeiran/hf-s3-gateway:latest
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
     ports:
       - "9000:9000"
     environment:
@@ -109,14 +118,16 @@ services:
       HF_BUCKET: "your-bucket"
       HF_TOKEN: "hf_xxx"
       DATA_DIR: "/data"
+      HF_WORK_DIR: "/data/.hf-tmp"
     volumes:
       - ./data:/data
 ```
 
 注意：
 
-- `./data` 目录需要容器用户可写，否则 HF 临时目录（如 `/data/.hf-tmp`）创建失败会导致列目录/上传报错
-- 如果使用挂载目录，确保权限允许容器内用户写入
+- 容器内服务以 UID `10001` 运行；`init-perms` 会在启动前把宿主机 `./data` 修正为该 UID 可写，避免 `/readyz` 出现 `mkdir /data/.hf-tmp: permission denied`。
+- 如果不使用上面的 `init-perms`，需要手动执行：`mkdir -p data && sudo chown -R 10001:10001 data`。
+- `HF_WORK_DIR` 用于 HF CLI 的 HOME/cache/XET 临时目录；`DATA_DIR` 同时用于 multipart 临时分片，因此二者所在路径都必须可写。
 - 不要把真实 `HF_TOKEN`、访问密钥、命名空间、桶名直接写进公开仓库文档
 
 ---

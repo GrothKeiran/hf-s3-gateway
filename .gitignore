@@ -2,5 +2,5 @@ bin/
 dist/
 .env
 .data/
-data/
 *.log
+data/
