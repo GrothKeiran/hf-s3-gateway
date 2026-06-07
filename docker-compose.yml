@@ -22,8 +22,14 @@ services:
       HF_TOKEN: "hf_xxx"
       DATA_DIR: "/data"
       HF_WORK_DIR: "/data/.hf-tmp"
+      PUBLIC_BASE_URL: "http://your-host:9000"
+      GATEWAY_SIGN_SECRET: "change-this-gateway-link-secret"
+      PUBLIC_READ: "false"
+      CORS_ALLOW_ORIGINS: "*"
+      OBJECT_CONTENT_DISPOSITION: "inline"
+      OBJECT_CACHE_CONTROL: ""
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3

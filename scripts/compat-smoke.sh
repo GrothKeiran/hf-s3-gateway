@@ -73,6 +73,9 @@ curl_smoke() {
   curl -fsSI -u "$S3_ACCESS_KEY:$S3_SECRET_KEY" "$(object_url "$SMALL_KEY")" >/dev/null
   curl -fsS -u "$S3_ACCESS_KEY:$S3_SECRET_KEY" -H 'Range: bytes=0-4' "$(object_url "$SMALL_KEY")" -o "$WORKDIR/curl-range.txt"
   test "$(cat "$WORKDIR/curl-range.txt")" = "hello"
+  signed_url="$(curl -fsS -u "$S3_ACCESS_KEY:$S3_SECRET_KEY" "$(object_url "$SMALL_KEY")?gateway-presign&expires=120" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')"
+  curl -fsS -H 'Range: bytes=0-4' "$signed_url" -o "$WORKDIR/gateway-signed-range.txt"
+  test "$(cat "$WORKDIR/gateway-signed-range.txt")" = "hello"
   curl -fsS -u "$S3_ACCESS_KEY:$S3_SECRET_KEY" "$(bucket_url "?list-type=2&prefix=$PREFIX/")" | grep -F "$SMALL_KEY" >/dev/null
   curl -fsS -u "$S3_ACCESS_KEY:$S3_SECRET_KEY" -X PUT --data-binary "@$WORKDIR/small.txt" "$(object_url "$DELETE_A_KEY")" >/dev/null
   curl -fsS -u "$S3_ACCESS_KEY:$S3_SECRET_KEY" -X PUT --data-binary "@$WORKDIR/small.txt" "$(object_url "$DELETE_B_KEY")" >/dev/null

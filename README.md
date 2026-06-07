@@ -25,6 +25,9 @@
 - `AWS Signature V4` 请求校验（header signing 与 presigned URL）
 - `/healthz` 存活检查接口
 - `/readyz` 就绪检查接口
+- 浏览器预览响应头：CORS、`Content-Disposition: inline`、可配置 `Cache-Control`
+- 网关自有签名直链：不依赖 HF signed redirect，支持 Range 播放/预览
+- 可选公开读：`PUBLIC_READ=true` 时允许对象 GET/HEAD 免鉴权
 - Multipart Upload 支持：
   - `CreateMultipartUpload`
   - `UploadPart`
@@ -49,8 +52,10 @@
 
 当前已知限制：
 
-- Hugging Face Buckets 暂不支持直接通过 `SignedGetURL` 返回真正可用的 HF 直链签名下载，因此下载仍以网关代理为主
+- Hugging Face Buckets 暂不支持直接通过 `SignedGetURL` 返回真正可用的 HF 原生签名直链；本项目提供网关自有签名直链和 S3 presigned URL，下载流量仍经过网关代理
 - 大文件上传时，前端可能会先显示 100%，但网关仍在后台把数据同步到 Hugging Face，这段时间会表现为“卡在 100%”
+- “无上传限制”取决于客户端、反向代理、容器磁盘空间、HF 后端配额和网络稳定性；网关侧按流式上传与 multipart 路径实现，不主动设置小文件大小上限
+- s3fs/FUSE 挂载需要宿主机提供 `/dev/fuse` 与 `s3fs`，当前环境无法替代真实宿主机完成 FUSE 实挂验证
 
 ---
 
@@ -119,6 +124,12 @@ services:
       HF_TOKEN: "hf_xxx"
       DATA_DIR: "/data"
       HF_WORK_DIR: "/data/.hf-tmp"
+      PUBLIC_BASE_URL: "http://your-host:9000"
+      GATEWAY_SIGN_SECRET: "change-this-gateway-link-secret"
+      PUBLIC_READ: "false"
+      CORS_ALLOW_ORIGINS: "*"
+      OBJECT_CONTENT_DISPOSITION: "inline"
+      OBJECT_CACHE_CONTROL: ""
     volumes:
       - ./data:/data
 ```

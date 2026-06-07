@@ -19,6 +19,10 @@ import (
 
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if isGatewaySignedDownload(c.Request) || isPublicObjectRead(c.Request) {
+			c.Next()
+			return
+		}
 		if !authEnabled() {
 			c.Next()
 			return

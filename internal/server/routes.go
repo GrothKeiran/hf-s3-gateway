@@ -173,6 +173,7 @@ func RegisterRoutes(r *gin.Engine) {
 	store := NewStorageFromEnv()
 	registerHealthRoutes(r, store)
 	mp := newMultipartStore()
+	r.Use(corsMiddleware())
 	r.Use(authMiddleware())
 	r.GET("/", handleListBuckets)
 	r.PUT("/:bucket", handleCreateBucket)
@@ -423,6 +424,21 @@ func handleGetObject(store Storage, mp *multipartStore) gin.HandlerFunc {
 		key := cleanKey(c.Param("key"))
 		if key == "" {
 			handleBucketOps(store, mp)(c)
+			return
+		}
+		if gatewayPresignRequested(c.Request) {
+			expiresIn := int64EnvLocal("GATEWAY_PRESIGN_DEFAULT_EXPIRES", 3600)
+			if raw := strings.TrimSpace(c.Query("expires")); raw != "" {
+				if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+					expiresIn = v
+				}
+			}
+			url, expiresAt, err := gatewaySignedURL(c.Request, expiresIn)
+			if err != nil {
+				writeS3Error(c, http.StatusBadRequest, "InvalidArgument", err.Error())
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"url": url, "expires": expiresAt})
 			return
 		}
 		if uploadID := c.Query("uploadId"); uploadID != "" {
@@ -837,10 +853,12 @@ func encodeListField(v, encodingType string) string {
 func setObjectHeaders(c *gin.Context, key string, meta ObjectInfo, length int64) {
 	c.Header("Accept-Ranges", "bytes")
 	c.Header("Content-Length", fmt.Sprintf("%d", length))
-	if ct := mime.TypeByExtension(path.Ext(key)); ct != "" {
-		c.Header("Content-Type", ct)
-	} else {
-		c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Type", contentTypeForKey(key))
+	if disposition := objectContentDisposition(key); disposition != "" {
+		c.Header("Content-Disposition", disposition)
+	}
+	if cacheControl := strings.TrimSpace(getenv("OBJECT_CACHE_CONTROL", "")); cacheControl != "" {
+		c.Header("Cache-Control", cacheControl)
 	}
 	if meta.ModTime.IsZero() {
 		meta.ModTime = time.Unix(0, 0).UTC()
@@ -849,6 +867,48 @@ func setObjectHeaders(c *gin.Context, key string, meta ObjectInfo, length int64)
 	if meta.ETag != "" {
 		c.Header("ETag", meta.ETag)
 	}
+}
+
+func contentTypeForKey(key string) string {
+	ext := strings.ToLower(path.Ext(key))
+	common := map[string]string{
+		".mkv":  "video/x-matroska",
+		".m3u8": "application/vnd.apple.mpegurl",
+		".ts":   "video/mp2t",
+		".flv":  "video/x-flv",
+		".webm": "video/webm",
+		".mov":  "video/quicktime",
+		".avi":  "video/x-msvideo",
+		".mp3":  "audio/mpeg",
+		".flac": "audio/flac",
+		".m4a":  "audio/mp4",
+		".wasm": "application/wasm",
+		".doc":  "application/msword",
+		".xls":  "application/vnd.ms-excel",
+		".ppt":  "application/vnd.ms-powerpoint",
+		".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	}
+	if ct := common[ext]; ct != "" {
+		return ct
+	}
+	if ct := mime.TypeByExtension(ext); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+func objectContentDisposition(key string) string {
+	mode := strings.TrimSpace(getenv("OBJECT_CONTENT_DISPOSITION", "inline"))
+	if mode == "" || strings.EqualFold(mode, "none") {
+		return ""
+	}
+	filename := path.Base(key)
+	if filename == "." || filename == "/" || filename == "" {
+		return mode
+	}
+	return fmt.Sprintf("%s; filename*=UTF-8''%s", mode, strings.ReplaceAll(url.PathEscape(filename), "+", "%20"))
 }
 
 func parseRange(header string, size int64) (httpRangeSpec, bool, error) {
