@@ -1,0 +1,10 @@
+.git
+.github
+.data
+data
+bin
+dist
+*.log
+.env
+Dockerfile*
+docker-compose*.yml

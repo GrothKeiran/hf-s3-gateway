@@ -1,0 +1,55 @@
+name: live-hf-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      require_hf_redirect:
+        description: "Fail if HF signed redirect URL is unavailable"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  live-hf:
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_NAMESPACE: ${{ secrets.HF_NAMESPACE }}
+      HF_BUCKET: ${{ secrets.HF_BUCKET }}
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY || 'live-smoke-access' }}
+      S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY || 'live-smoke-secret-key' }}
+      REQUIRE_HF_REDIRECT: ${{ inputs.require_hf_redirect == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check live HF secrets
+        id: secrets
+        run: |
+          if [ -n "$HF_TOKEN" ] && [ -n "$HF_NAMESPACE" ] && [ -n "$HF_BUCKET" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping live HF smoke: configure HF_TOKEN, HF_NAMESPACE, and HF_BUCKET repository secrets to enable it."
+          fi
+      - uses: actions/setup-go@v5
+        if: steps.secrets.outputs.enabled == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v5
+        if: steps.secrets.outputs.enabled == 'true'
+        with:
+          python-version: "3.x"
+      - name: Install clients
+        if: steps.secrets.outputs.enabled == 'true'
+        run: |
+          python -m pip install --upgrade pip awscli 'huggingface_hub[cli]'
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+          chmod +x /usr/local/bin/mc
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp
+          cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+          chmod +x /usr/local/bin/rclone
+      - name: Run live HF smoke
+        if: steps.secrets.outputs.enabled == 'true'
+        run: ./scripts/hf-live-smoke.sh

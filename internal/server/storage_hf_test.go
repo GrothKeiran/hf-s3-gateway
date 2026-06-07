@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,14 +57,8 @@ JSON
 fi
 exit 1
 `
-	if err := os.WriteFile(fakeHF, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Setenv("HF_BIN", fakeHF)
-	t.Setenv("HF_NAMESPACE", "ns")
-	t.Setenv("HF_BUCKET", "bucket")
-	t.Setenv("HF_WORK_DIR", filepath.Join(tmp, "work"))
+	writeFakeHF(t, fakeHF, script)
+	setHFTestEnv(t, tmp, fakeHF)
 
 	s := newHFPlaceholderStorage().(*hfCLIStorage)
 	items, err := s.ListObjects(context.Background(), "docs/")
@@ -76,4 +71,92 @@ exit 1
 	if items[0].Key != "docs/readme.md" || items[1].Key != "docs/spec.txt" {
 		t.Fatalf("unexpected keys: %+v", items)
 	}
+}
+
+func TestHFHeadObjectFallsBackToCLIList(t *testing.T) {
+	tmp := t.TempDir()
+	fakeHF := filepath.Join(tmp, "hf")
+	script := `#!/usr/bin/env bash
+set -e
+if [[ "$1" == "buckets" && ( "$2" == "ls" || "$2" == "list" ) ]]; then
+  cat <<'JSON'
+[{"path":"docs/readme.md","size":10,"etag":"e1","last_modified":"2026-03-31T06:00:00Z"}]
+JSON
+  exit 0
+fi
+exit 1
+`
+	writeFakeHF(t, fakeHF, script)
+	setHFTestEnv(t, tmp, fakeHF)
+	t.Setenv("HF_SDK_LIST", "false")
+
+	s := newHFPlaceholderStorage().(*hfCLIStorage)
+	meta, err := s.HeadObject(context.Background(), "docs/readme.md")
+	if err != nil {
+		t.Fatalf("HeadObject error: %v", err)
+	}
+	if meta.Key != "docs/readme.md" || meta.Size != 10 || meta.ETag != "\"e1\"" {
+		t.Fatalf("unexpected metadata: %+v", meta)
+	}
+}
+
+func TestHFDeleteObjectTreatsCLINotFoundAsSuccess(t *testing.T) {
+	tmp := t.TempDir()
+	fakeHF := filepath.Join(tmp, "hf")
+	script := `#!/usr/bin/env bash
+if [[ "$1" == "buckets" && "$2" == "rm" ]]; then
+  echo "object not found" >&2
+  exit 1
+fi
+exit 1
+`
+	writeFakeHF(t, fakeHF, script)
+	setHFTestEnv(t, tmp, fakeHF)
+	t.Setenv("HF_SDK_DELETE", "false")
+
+	s := newHFPlaceholderStorage().(*hfCLIStorage)
+	if err := s.DeleteObject(context.Background(), "missing.txt"); err != nil {
+		t.Fatalf("missing delete should be idempotent, got %v", err)
+	}
+}
+
+func TestHFGetObjectMissingStopsBeforeCLIStream(t *testing.T) {
+	tmp := t.TempDir()
+	fakeHF := filepath.Join(tmp, "hf")
+	script := `#!/usr/bin/env bash
+if [[ "$1" == "buckets" && ( "$2" == "ls" || "$2" == "list" ) ]]; then
+  echo "[]"
+  exit 0
+fi
+if [[ "$1" == "buckets" && "$2" == "cp" ]]; then
+  echo "cp should not be reached for missing object" >&2
+  exit 2
+fi
+exit 1
+`
+	writeFakeHF(t, fakeHF, script)
+	setHFTestEnv(t, tmp, fakeHF)
+	t.Setenv("HF_SDK_GET", "false")
+	t.Setenv("HF_SDK_LIST", "false")
+
+	s := newHFPlaceholderStorage().(*hfCLIStorage)
+	_, _, err := s.GetObject(context.Background(), "missing.txt")
+	if !errors.Is(err, errNotFound) {
+		t.Fatalf("expected errNotFound, got %v", err)
+	}
+}
+
+func writeFakeHF(t *testing.T, path, script string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setHFTestEnv(t *testing.T, tmp, fakeHF string) {
+	t.Helper()
+	t.Setenv("HF_BIN", fakeHF)
+	t.Setenv("HF_NAMESPACE", "ns")
+	t.Setenv("HF_BUCKET", "bucket")
+	t.Setenv("HF_WORK_DIR", filepath.Join(tmp, "work"))
 }

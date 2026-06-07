@@ -57,7 +57,10 @@ func (s *localStorage) PutObject(ctx context.Context, key string, body io.Reader
 	if key == "" {
 		return nil
 	}
-	path := filepath.Join(s.root, filepath.FromSlash(key))
+	path, err := s.pathForKey(key)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -72,7 +75,10 @@ func (s *localStorage) PutObject(ctx context.Context, key string, body io.Reader
 
 func (s *localStorage) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
 	_ = ctx
-	path := filepath.Join(s.root, filepath.FromSlash(cleanKey(key)))
+	path, err := s.pathForKey(key)
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -96,7 +102,10 @@ func (s *localStorage) GetObject(ctx context.Context, key string) (io.ReadCloser
 
 func (s *localStorage) HeadObject(ctx context.Context, key string) (ObjectInfo, error) {
 	_ = ctx
-	path := filepath.Join(s.root, filepath.FromSlash(cleanKey(key)))
+	path, err := s.pathForKey(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
 	st, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -115,9 +124,36 @@ func (s *localStorage) HeadObject(ctx context.Context, key string) (ObjectInfo, 
 
 func (s *localStorage) DeleteObject(ctx context.Context, key string) error {
 	_ = ctx
-	path := filepath.Join(s.root, filepath.FromSlash(cleanKey(key)))
+	path, err := s.pathForKey(key)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
+}
+
+func (s *localStorage) pathForKey(key string) (string, error) {
+	key = cleanKey(key)
+	if key == "" {
+		return s.root, nil
+	}
+	for _, part := range strings.Split(filepath.ToSlash(key), "/") {
+		if part == ".." {
+			return "", errInvalidKey
+		}
+	}
+	root, err := filepath.Abs(s.root)
+	if err != nil {
+		return "", err
+	}
+	p, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(key)))
+	if err != nil {
+		return "", err
+	}
+	if p != root && !strings.HasPrefix(p, root+string(os.PathSeparator)) {
+		return "", errInvalidKey
+	}
+	return p, nil
 }

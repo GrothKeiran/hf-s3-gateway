@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -108,6 +110,9 @@ func validatePresignedSigV4(r *http.Request) error {
 	if len(credParts) != 5 {
 		return fmt.Errorf("invalid credential scope")
 	}
+	if err := validatePresignExpiry(q.Get("X-Amz-Date"), q.Get("X-Amz-Expires")); err != nil {
+		return err
+	}
 	signedHeaders := strings.Split(strings.ToLower(q.Get("X-Amz-SignedHeaders")), ";")
 	parsed := &sigV4Auth{
 		AccessKey:     credParts[0],
@@ -118,6 +123,25 @@ func validatePresignedSigV4(r *http.Request) error {
 		Signature:     strings.ToLower(q.Get("X-Amz-Signature")),
 	}
 	return validateSigV4Fields(r, parsed, q.Get("X-Amz-Date"), q.Get("X-Amz-Content-Sha256"), filterPresignSignature(r.URL.RawQuery))
+}
+
+func validatePresignExpiry(amzDate, rawExpires string) error {
+	t, err := time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		return fmt.Errorf("invalid X-Amz-Date")
+	}
+	expires, err := strconv.ParseInt(rawExpires, 10, 64)
+	if err != nil || expires < 1 || expires > 604800 {
+		return fmt.Errorf("invalid X-Amz-Expires")
+	}
+	now := time.Now().UTC()
+	if now.Before(t.Add(-15 * time.Minute)) {
+		return fmt.Errorf("X-Amz-Date is too far in the future")
+	}
+	if now.After(t.Add(time.Duration(expires) * time.Second)) {
+		return fmt.Errorf("presigned URL has expired")
+	}
+	return nil
 }
 
 func validateSigV4Fields(r *http.Request, parsed *sigV4Auth, amzDate, payloadHash, rawQuery string) error {
@@ -246,16 +270,66 @@ func canonicalURI(path string) string {
 	if path == "" {
 		return "/"
 	}
-	return path
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return awsURIEncode(path, false)
 }
 
 func canonicalQueryString(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	parts := strings.Split(raw, "&")
-	sort.Strings(parts)
-	return strings.Join(parts, "&")
+	type queryPart struct {
+		Name  string
+		Value string
+	}
+	parts := make([]queryPart, 0)
+	for _, p := range strings.Split(raw, "&") {
+		if p == "" {
+			continue
+		}
+		name, value, _ := strings.Cut(p, "=")
+		decodedName, err := url.QueryUnescape(name)
+		if err != nil {
+			decodedName = name
+		}
+		decodedValue, err := url.QueryUnescape(value)
+		if err != nil {
+			decodedValue = value
+		}
+		parts = append(parts, queryPart{
+			Name:  awsURIEncode(decodedName, true),
+			Value: awsURIEncode(decodedValue, true),
+		})
+	}
+	sort.Slice(parts, func(i, j int) bool {
+		if parts[i].Name == parts[j].Name {
+			return parts[i].Value < parts[j].Value
+		}
+		return parts[i].Name < parts[j].Name
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, p.Name+"="+p.Value)
+	}
+	return strings.Join(out, "&")
+}
+
+func awsURIEncode(s string, encodeSlash bool) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case ch >= 'A' && ch <= 'Z', ch >= 'a' && ch <= 'z', ch >= '0' && ch <= '9', ch == '-', ch == '_', ch == '.', ch == '~':
+			b.WriteByte(ch)
+		case ch == '/' && !encodeSlash:
+			b.WriteByte(ch)
+		default:
+			b.WriteString(fmt.Sprintf("%%%02X", ch))
+		}
+	}
+	return b.String()
 }
 
 func deriveSigV4Key(secret, date, region, service string) []byte {

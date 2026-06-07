@@ -12,5 +12,11 @@ services:
       HF_BUCKET: "your-bucket"
       HF_TOKEN: "hf_xxx"
       DATA_DIR: "/data"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       - ./data:/data

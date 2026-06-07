@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-var errNotFound = errors.New("object not found")
+var (
+	errNotFound   = errors.New("object not found")
+	errInvalidKey = errors.New("invalid object key")
+)
 
 type ObjectInfo struct {
 	Key          string

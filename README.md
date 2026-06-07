@@ -13,24 +13,31 @@
 - 单逻辑 Bucket 暴露
 - `ListBuckets`
 - `HeadBucket`
-- `ListObjectsV2`
+- `ListObjects` / `ListObjectsV2`
+- `GetBucketLocation` / `GetBucketVersioning` / `GetBucketAcl`
 - `PutObject`
-- `GetObject`
-- `HeadObject`
+- `GetObject` / `HeadObject`
+- `Range GET/HEAD`（断点续传、挂载读取）
+- `CopyObject`
 - `DeleteObject`
+- `DeleteObjects` 批量删除
 - `Basic Auth`
-- `AWS Signature V4` 请求校验（兼容 OpenList 等 S3 客户端）
-- `/healthz` 健康检查接口
-- Multipart Upload 基础支持：
+- `AWS Signature V4` 请求校验（header signing 与 presigned URL）
+- `/healthz` 存活检查接口
+- `/readyz` 就绪检查接口
+- Multipart Upload 支持：
   - `CreateMultipartUpload`
   - `UploadPart`
+  - `ListMultipartUploads`
+  - `ListParts`
   - `CompleteMultipartUpload`
+  - `AbortMultipartUpload`
 
 ---
 
 ## 当前状态
 
-项目已完成 MVP 阶段，当前重点是继续提升与 OpenList 的兼容性，以及优化大文件上传体验。
+项目已从 MVP 进入兼容性完善阶段，当前重点是让 OpenList、AWS CLI、rclone、MinIO Client、s3fs 等常见 S3 客户端都能稳定完成上传、删除、列表、断点读取、预签名下载和 multipart 上传。
 
 已完成的重要兼容修复包括：
 
@@ -124,6 +131,76 @@ services:
 - Bucket: `your-bucket`
 - Region: `auto`
 - Force Path Style: `true`
+
+---
+
+## 兼容性验证
+
+启动网关后，可以使用内置 smoke 脚本验证真实 S3 客户端行为。该脚本会在指定 bucket 下创建临时前缀，覆盖小文件上传、Range 下载、presigned URL 下载、multipart 上传、复制、批量删除、列表，以及可选 s3fs 挂载。
+
+注意：服务端暴露的 bucket 名来自 `HF_BUCKET`，脚本里的 `S3_BUCKET` 必须与服务端 `HF_BUCKET` 一致。
+
+```bash
+export S3_ENDPOINT="http://127.0.0.1:9000"
+export S3_BUCKET="your-bucket"
+export S3_ACCESS_KEY="your-access-key"
+export S3_SECRET_KEY="your-secret-key"
+
+./scripts/compat-smoke.sh
+```
+
+脚本会自动跳过本机未安装的客户端：
+
+- `aws`：验证 `s3api`、`s3 cp`、presigned URL、multipart、批量删除
+- `mc`：验证 MinIO Client 的上传、读取、删除
+- `rclone`：验证挂载类工具常用的 copy/list/cat/delete 行为
+- `s3fs`：默认跳过；如需验证 FUSE 挂载，安装 `s3fs` 后设置 `RUN_S3FS=1`
+
+HF 后端实测建议：
+
+1. 准备真实 `HF_NAMESPACE`、`HF_BUCKET`、`HF_TOKEN`，并确保账号对 HF Bucket 有读写权限。
+2. 运行 live smoke 脚本，它会启动 `STORAGE_BACKEND=hf` 网关，检查 `/readyz`，运行 `compat-smoke.sh`，并验证对象可通过 `hf` CLI 看到：
+
+```bash
+export HF_TOKEN="hf_xxx"
+export HF_NAMESPACE="your-namespace"
+export HF_BUCKET="your-bucket"
+export S3_ACCESS_KEY="your-access-key"
+export S3_SECRET_KEY="your-secret-key"
+
+./scripts/hf-live-smoke.sh
+```
+
+3. 如果需要把 HF 自身签名 redirect URL 作为硬性要求，额外设置：
+
+```bash
+REQUIRE_HF_REDIRECT=1 ./scripts/hf-live-smoke.sh
+```
+
+如果 Hugging Face 当前环境无法提供可用 signed redirect URL，脚本会失败；不设置该变量时，网关会验证代理下载与 S3 presigned URL 路径。
+
+4. 大文件验证建议至少覆盖 10MiB 以上对象，以触发 multipart 或客户端分片路径。
+
+s3fs/FUSE 挂载验证需要宿主机具备 `/dev/fuse`、`s3fs`、`fusermount` 或 `fusermount3`：
+
+```bash
+export S3_ENDPOINT="http://127.0.0.1:9000"
+export S3_BUCKET="your-bucket"
+export S3_ACCESS_KEY="your-access-key"
+export S3_SECRET_KEY="your-secret-key"
+
+./scripts/s3fs-smoke.sh
+```
+
+---
+
+## 生产运行建议
+
+- 容器内已配置 `/healthz` 健康检查，编排系统可使用 `/readyz` 做就绪检查。
+- 默认 HTTP server 启用 `ReadHeaderTimeout`、`IdleTimeout` 和优雅停机，避免慢请求占用连接。
+- 大文件上传/下载不要设置过短的反向代理超时；HF 后端同步期间客户端可能等待较久。
+- 如果需要就绪检查真实访问后端，可设置 `READY_CHECK_STORAGE=true`，但 HF 后端会产生一次列表请求。
+- 建议在反向代理层开启 HTTPS，再把内部 HTTP endpoint 暴露给 S3 客户端。
 
 ---
 

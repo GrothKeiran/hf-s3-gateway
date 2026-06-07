@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -203,20 +204,32 @@ func parseHFListText(text, prefix string) []ObjectInfo {
 		if len(fields) == 0 {
 			continue
 		}
-		key := cleanKey(fields[len(fields)-1])
+		key, size := parseHFListTextFallbackLine(line, fields)
 		if key == "" || strings.HasSuffix(key, "/") {
 			continue
 		}
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		var size int64
-		if n, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(fields[0]), "B"), 10, 64); err == nil {
-			size = n
-		}
 		out = append(out, ObjectInfo{Key: key, Size: size, StorageClass: "STANDARD"})
 	}
 	return out
+}
+
+func parseHFListTextFallbackLine(line string, fields []string) (string, int64) {
+	if n, err := parseHFSizeField(fields[0]); err == nil {
+		key := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+		return cleanKey(key), n
+	}
+	if n, err := parseHFSizeField(fields[len(fields)-1]); err == nil {
+		key := strings.TrimSpace(strings.TrimSuffix(line, fields[len(fields)-1]))
+		return cleanKey(key), n
+	}
+	return cleanKey(fields[len(fields)-1]), 0
+}
+
+func parseHFSizeField(v string) (int64, error) {
+	return strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(v), "B"), 10, 64)
 }
 
 func firstString(m map[string]any, keys ...string) string {
@@ -330,6 +343,8 @@ func (s *hfCLIStorage) GetObject(ctx context.Context, key string) (io.ReadCloser
 	if hfSDKEnabled("HF_SDK_GET", true) && getMax > 0 {
 		if rc, meta, err := s.getObjectViaPython(ctx, key, getMax); err == nil {
 			return rc, meta, nil
+		} else if errors.Is(err, errNotFound) || isHFNotFound(err) {
+			return nil, ObjectInfo{}, errNotFound
 		}
 	}
 	return s.getObjectViaCLIStream(ctx, key)
@@ -340,8 +355,14 @@ func (s *hfCLIStorage) HeadObject(ctx context.Context, key string) (ObjectInfo, 
 	// Fast path: metadata-only call via bridge (no file download)
 	if meta, err := s.getObjectMetaViaPython(ctx, key); err == nil {
 		return meta, nil
+	} else if errors.Is(err, errNotFound) || isHFNotFound(err) {
+		return ObjectInfo{}, errNotFound
 	}
-	// Slow path: fall back to full GetObject (downloads entire file)
+	if meta, err := s.getObjectMetaViaList(ctx, key); err == nil {
+		return meta, nil
+	} else if errors.Is(err, errNotFound) || isHFNotFound(err) {
+		return ObjectInfo{}, errNotFound
+	}
 	body, meta, err := s.GetObject(ctx, key)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -357,9 +378,14 @@ func (s *hfCLIStorage) DeleteObject(ctx context.Context, key string) error {
 	if hfSDKEnabled("HF_SDK_DELETE", true) {
 		if err := s.deleteObjectViaPython(ctx, key); err == nil {
 			return nil
+		} else if errors.Is(err, errNotFound) || isHFNotFound(err) {
+			return nil
 		}
 	}
 	_, err := s.cli.run(ctx, "buckets", "rm", "-y", s.cli.bucketURI(key))
+	if errors.Is(err, errNotFound) || isHFNotFound(err) {
+		return nil
+	}
 	return err
 }
 
@@ -393,6 +419,9 @@ func (s *hfCLIStorage) deleteObjectViaPython(ctx context.Context, key string) er
 		"key":       cleanKey(key),
 	}
 	_, err := s.bridge.call(ctx, "delete_object", params)
+	if isHFNotFound(err) {
+		return errNotFound
+	}
 	return err
 }
 
@@ -446,6 +475,9 @@ func (s *hfCLIStorage) getObjectMetaViaPython(ctx context.Context, key string) (
 	}
 	result, err := s.bridge.call(ctx, "get_meta", params)
 	if err != nil {
+		if isHFNotFound(err) {
+			return ObjectInfo{}, errNotFound
+		}
 		return ObjectInfo{}, err
 	}
 	var res struct {
@@ -466,6 +498,26 @@ func (s *hfCLIStorage) getObjectMetaViaPython(ctx context.Context, key string) (
 	}, nil
 }
 
+func (s *hfCLIStorage) getObjectMetaViaList(ctx context.Context, key string) (ObjectInfo, error) {
+	key = cleanKey(key)
+	items, err := s.ListObjects(ctx, key)
+	if err != nil {
+		if isHFNotFound(err) {
+			return ObjectInfo{}, errNotFound
+		}
+		return ObjectInfo{}, err
+	}
+	for _, item := range items {
+		if cleanKey(item.Key) == key {
+			if item.StorageClass == "" {
+				item.StorageClass = "STANDARD"
+			}
+			return item, nil
+		}
+	}
+	return ObjectInfo{}, errNotFound
+}
+
 func (s *hfCLIStorage) getObjectViaPython(ctx context.Context, key string, maxBytes int64) (io.ReadCloser, ObjectInfo, error) {
 	params := map[string]interface{}{
 		"bucket_id": s.cli.namespace + "/" + s.cli.bucket,
@@ -474,6 +526,9 @@ func (s *hfCLIStorage) getObjectViaPython(ctx context.Context, key string, maxBy
 	}
 	result, err := s.bridge.call(ctx, "get_object", params)
 	if err != nil {
+		if isHFNotFound(err) {
+			return nil, ObjectInfo{}, errNotFound
+		}
 		return nil, ObjectInfo{}, err
 	}
 	var res struct {
@@ -554,6 +609,15 @@ func (s *hfCLIStorage) putObjectViaCLIStream(ctx context.Context, key string, bo
 
 func (s *hfCLIStorage) getObjectViaCLIStream(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
 	meta, metaErr := s.getObjectMetaViaPython(ctx, key)
+	if errors.Is(metaErr, errNotFound) || isHFNotFound(metaErr) {
+		return nil, ObjectInfo{}, errNotFound
+	}
+	if metaErr != nil {
+		meta, metaErr = s.getObjectMetaViaList(ctx, key)
+		if errors.Is(metaErr, errNotFound) || isHFNotFound(metaErr) {
+			return nil, ObjectInfo{}, errNotFound
+		}
+	}
 
 	cmd := exec.CommandContext(ctx, s.cli.bin, "buckets", "cp", s.cli.bucketURI(key), "-")
 	cmd.Dir = s.cli.workDir
@@ -598,6 +662,18 @@ func isHFNotImplemented(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "hf backend not implemented yet") || strings.Contains(msg, "hf backend list not implemented yet")
+}
+
+func isHFNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "404") ||
+		strings.Contains(msg, "no such file") ||
+		strings.Contains(msg, "no such object") ||
+		strings.Contains(msg, "path does not exist")
 }
 
 type cmdReadCloser struct {

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 var (
@@ -33,10 +35,10 @@ type multipartStore struct {
 }
 
 type multipartUpload struct {
-	UploadID  string                   `json:"upload_id"`
-	Bucket    string                   `json:"bucket"`
-	Key       string                   `json:"key"`
-	CreatedAt time.Time                `json:"created_at"`
+	UploadID  string                    `json:"upload_id"`
+	Bucket    string                    `json:"bucket"`
+	Key       string                    `json:"key"`
+	CreatedAt time.Time                 `json:"created_at"`
 	Parts     map[int]multipartPartMeta `json:"parts"`
 }
 
@@ -72,6 +74,53 @@ type completeMultipartUploadResult struct {
 	Bucket   string   `xml:"Bucket"`
 	Key      string   `xml:"Key"`
 	ETag     string   `xml:"ETag"`
+}
+
+type listMultipartUploadsResult struct {
+	XMLName            xml.Name              `xml:"ListMultipartUploadsResult"`
+	Xmlns              string                `xml:"xmlns,attr,omitempty"`
+	Bucket             string                `xml:"Bucket"`
+	KeyMarker          string                `xml:"KeyMarker"`
+	UploadIDMarker     string                `xml:"UploadIdMarker"`
+	NextKeyMarker      string                `xml:"NextKeyMarker,omitempty"`
+	NextUploadIDMarker string                `xml:"NextUploadIdMarker,omitempty"`
+	Prefix             string                `xml:"Prefix,omitempty"`
+	Delimiter          string                `xml:"Delimiter,omitempty"`
+	MaxUploads         int                   `xml:"MaxUploads"`
+	IsTruncated        bool                  `xml:"IsTruncated"`
+	Uploads            []multipartUploadItem `xml:"Upload,omitempty"`
+}
+
+type multipartUploadItem struct {
+	Key          string `xml:"Key"`
+	UploadID     string `xml:"UploadId"`
+	Initiator    owner  `xml:"Initiator"`
+	Owner        owner  `xml:"Owner"`
+	StorageClass string `xml:"StorageClass"`
+	Initiated    string `xml:"Initiated"`
+}
+
+type listPartsResult struct {
+	XMLName              xml.Name       `xml:"ListPartsResult"`
+	Xmlns                string         `xml:"xmlns,attr,omitempty"`
+	Bucket               string         `xml:"Bucket"`
+	Key                  string         `xml:"Key"`
+	UploadID             string         `xml:"UploadId"`
+	Initiator            owner          `xml:"Initiator"`
+	Owner                owner          `xml:"Owner"`
+	StorageClass         string         `xml:"StorageClass"`
+	PartNumberMarker     int            `xml:"PartNumberMarker"`
+	NextPartNumberMarker int            `xml:"NextPartNumberMarker,omitempty"`
+	MaxParts             int            `xml:"MaxParts"`
+	IsTruncated          bool           `xml:"IsTruncated"`
+	Parts                []partListItem `xml:"Part,omitempty"`
+}
+
+type partListItem struct {
+	PartNumber   int    `xml:"PartNumber"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
 }
 
 func newMultipartStore() *multipartStore {
@@ -228,15 +277,20 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 	}
 	var readers []io.Reader
 	var openFiles []*os.File
-	wholeHash := md5.New()
+	multipartHash := md5.New()
 	for idx, part := range requested {
 		meta, ok := u.Parts[part.PartNumber]
 		if !ok {
 			return completeMultipartUploadResult{}, fmt.Errorf("%w: missing part %d", errInvalidPart, part.PartNumber)
 		}
-		if part.ETag != "" && strings.TrimSpace(part.ETag) != meta.ETag {
+		if part.ETag != "" && canonicalETag(part.ETag) != canonicalETag(meta.ETag) {
 			return completeMultipartUploadResult{}, fmt.Errorf("%w: etag mismatch for part %d", errInvalidPart, part.PartNumber)
 		}
+		partMD5, err := hex.DecodeString(strings.Trim(canonicalETag(meta.ETag), "\""))
+		if err != nil {
+			return completeMultipartUploadResult{}, fmt.Errorf("%w: invalid etag for part %d", errInvalidPart, part.PartNumber)
+		}
+		_, _ = multipartHash.Write(partMD5)
 		if idx < len(requested)-1 && meta.Size < 5*1024*1024 {
 			return completeMultipartUploadResult{}, fmt.Errorf("%w: part %d too small", errEntityTooSmall, part.PartNumber)
 		}
@@ -248,7 +302,7 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 			return completeMultipartUploadResult{}, err
 		}
 		openFiles = append(openFiles, f)
-		readers = append(readers, io.TeeReader(f, wholeHash))
+		readers = append(readers, f)
 	}
 	defer func() {
 		for _, f := range openFiles {
@@ -259,7 +313,7 @@ func (m *multipartStore) complete(ctx context.Context, store Storage, uploadID s
 	if err := store.PutObject(ctx, u.Key, io.MultiReader(readers...)); err != nil {
 		return completeMultipartUploadResult{}, err
 	}
-	etag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(wholeHash.Sum(nil)), len(requested))
+	etag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(multipartHash.Sum(nil)), len(requested))
 	_ = m.abortUnlocked(uploadID)
 	return completeMultipartUploadResult{
 		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
@@ -321,4 +375,188 @@ func storedPartNumbersOf(parts map[int]multipartPartMeta) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+func handleListMultipartUploads(m *multipartStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		prefix := cleanKey(c.Query("prefix"))
+		maxUploads := parseMaxKeys(c.Query("max-uploads"), 1000)
+		keyMarker := cleanKey(c.Query("key-marker"))
+		uploadIDMarker := c.Query("upload-id-marker")
+		uploads, truncated, nextKey, nextUploadID, err := m.listUploads(c.Param("bucket"), prefix, keyMarker, uploadIDMarker, maxUploads)
+		if err != nil {
+			handleStorageErr(c, err)
+			return
+		}
+		items := make([]multipartUploadItem, 0, len(uploads))
+		owner := owner{ID: "hf-s3-gateway", DisplayName: "hf-s3-gateway"}
+		for _, u := range uploads {
+			items = append(items, multipartUploadItem{
+				Key:          u.Key,
+				UploadID:     u.UploadID,
+				Initiator:    owner,
+				Owner:        owner,
+				StorageClass: "STANDARD",
+				Initiated:    formatS3Time(u.CreatedAt),
+			})
+		}
+		writeXML(c, 200, listMultipartUploadsResult{
+			Xmlns:              "http://s3.amazonaws.com/doc/2006-03-01/",
+			Bucket:             c.Param("bucket"),
+			KeyMarker:          keyMarker,
+			UploadIDMarker:     uploadIDMarker,
+			NextKeyMarker:      nextKey,
+			NextUploadIDMarker: nextUploadID,
+			Prefix:             prefix,
+			Delimiter:          c.Query("delimiter"),
+			MaxUploads:         maxUploads,
+			IsTruncated:        truncated,
+			Uploads:            items,
+		})
+	}
+}
+
+func handleListParts(m *multipartStore, key, uploadID string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		maxParts := parseMaxKeys(c.Query("max-parts"), 1000)
+		marker := parseIntDefault(c.Query("part-number-marker"), 0)
+		u, parts, truncated, nextMarker, err := m.listParts(uploadID, marker, maxParts)
+		if err != nil {
+			handleMultipartErr(c, err)
+			return
+		}
+		if u.Bucket != c.Param("bucket") || u.Key != cleanKey(key) {
+			handleMultipartErr(c, errNoSuchUpload)
+			return
+		}
+		items := make([]partListItem, 0, len(parts))
+		for _, p := range parts {
+			items = append(items, partListItem{
+				PartNumber:   p.PartNumber,
+				LastModified: formatS3Time(p.UpdatedAt),
+				ETag:         p.ETag,
+				Size:         p.Size,
+			})
+		}
+		owner := owner{ID: "hf-s3-gateway", DisplayName: "hf-s3-gateway"}
+		writeXML(c, 200, listPartsResult{
+			Xmlns:                "http://s3.amazonaws.com/doc/2006-03-01/",
+			Bucket:               u.Bucket,
+			Key:                  u.Key,
+			UploadID:             u.UploadID,
+			Initiator:            owner,
+			Owner:                owner,
+			StorageClass:         "STANDARD",
+			PartNumberMarker:     marker,
+			NextPartNumberMarker: nextMarker,
+			MaxParts:             maxParts,
+			IsTruncated:          truncated,
+			Parts:                items,
+		})
+	}
+}
+
+func (m *multipartStore) listUploads(bucket, prefix, keyMarker, uploadIDMarker string, maxUploads int) ([]multipartUpload, bool, string, string, error) {
+	if maxUploads == 0 {
+		return nil, false, "", "", nil
+	}
+	entries, err := os.ReadDir(m.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, "", "", nil
+		}
+		return nil, false, "", "", err
+	}
+	uploads := make([]multipartUpload, 0)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		u, err := m.load(entry.Name())
+		if err != nil {
+			continue
+		}
+		if u.Bucket != bucket || (prefix != "" && !strings.HasPrefix(u.Key, prefix)) {
+			continue
+		}
+		uploads = append(uploads, *u)
+	}
+	sort.Slice(uploads, func(i, j int) bool {
+		if uploads[i].Key == uploads[j].Key {
+			return uploads[i].UploadID < uploads[j].UploadID
+		}
+		return uploads[i].Key < uploads[j].Key
+	})
+	out := make([]multipartUpload, 0, minInt(maxUploads, len(uploads)))
+	var last multipartUpload
+	for _, u := range uploads {
+		if keyMarker != "" {
+			if u.Key < keyMarker || (u.Key == keyMarker && (uploadIDMarker == "" || u.UploadID <= uploadIDMarker)) {
+				continue
+			}
+		}
+		if len(out) >= maxUploads {
+			if last.UploadID == "" {
+				return out, false, "", "", nil
+			}
+			return out, true, last.Key, last.UploadID, nil
+		}
+		out = append(out, u)
+		last = u
+	}
+	return out, false, "", "", nil
+}
+
+func (m *multipartStore) listParts(uploadID string, marker, maxParts int) (*multipartUpload, []multipartPartMeta, bool, int, error) {
+	if maxParts == 0 {
+		u, err := m.load(uploadID)
+		return u, nil, false, 0, err
+	}
+	u, err := m.load(uploadID)
+	if err != nil {
+		return nil, nil, false, 0, err
+	}
+	partsMap, err := m.loadPartsFromDisk(uploadID)
+	if err != nil {
+		return nil, nil, false, 0, err
+	}
+	parts := make([]multipartPartMeta, 0, len(partsMap))
+	for _, p := range partsMap {
+		if p.PartNumber > marker {
+			parts = append(parts, p)
+		}
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })
+	if len(parts) <= maxParts {
+		return u, parts, false, 0, nil
+	}
+	out := parts[:maxParts]
+	return u, out, true, out[len(out)-1].PartNumber, nil
+}
+
+func canonicalETag(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	v = strings.Trim(v, "\"")
+	return fmt.Sprintf("\"%s\"", v)
+}
+
+func parseIntDefault(raw string, fallback int) int {
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
